@@ -1,7 +1,22 @@
 /target
+/dist
 
-# Real configuration and the cached refresh token belong in the user's config
-# directory, never in the repo. This is belt-and-braces in case someone drops a
-# working copy here while debugging.
+# Real configuration, the cached refresh token and the audit log all belong in
+# the user's config directory, never in the repo. This is belt-and-braces in
+# case a working copy is dropped here while debugging.
+#
+# token.json is the one that genuinely matters: it holds a refresh token, a
+# bearer credential for the tenant. config.ini holds no secret, but it does name
+# which tenant is being administered. actions.log records who changed what.
 config.ini
 token.json
+actions.log
+
+# Exports, which contain real directory data — names, addresses, device serial
+# numbers. Matched on the names the export dialog suggests rather than on *.csv
+# and *.json, so a legitimate file of either type is not silently swallowed.
+gcm-*.csv
+gcm-*.json
+
+# macOS
+.DS_Store
