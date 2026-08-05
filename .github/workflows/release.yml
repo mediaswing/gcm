@@ -220,7 +220,29 @@ jobs:
             exit 0
           fi
 
-          SHA256=$(sha256sum "$FILE" | cut -d' ' -f1)
+          # The report is addressed by the file's own SHA-256, so the hash is
+          # what makes the link in the release notes work at all.
+          #
+          # No single tool computes it on all three runners: macOS has no
+          # `sha256sum` (its GNU userland is not installed — the image aliases
+          # GNU tar as `gtar`, which is the giveaway), while Git Bash on Windows
+          # has `sha256sum` but not always `shasum`. Try each in turn rather
+          # than assuming.
+          if command -v sha256sum >/dev/null 2>&1; then
+            SHA256=$(sha256sum "$FILE" | cut -d' ' -f1)
+          elif command -v shasum >/dev/null 2>&1; then
+            SHA256=$(shasum -a 256 "$FILE" | cut -d' ' -f1)
+          else
+            SHA256=$(openssl dgst -sha256 "$FILE" | awk '{print $NF}')
+          fi
+
+          # Without a hash there is no link to publish, and uploading anyway
+          # would report success while writing a URL that goes nowhere.
+          if [ -z "$SHA256" ]; then
+            echo "Could not compute a SHA-256 for $FILE; skipping VirusTotal."
+            exit 0
+          fi
+
           HTTP_STATUS=$(curl -s -o /tmp/vt_response.json -w "%{http_code}" \
             --request POST \
             --url https://www.virustotal.com/api/v3/files \
