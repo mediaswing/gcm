@@ -1,0 +1,7 @@
+/target
+
+# Real configuration and the cached refresh token belong in the user's config
+# directory, never in the repo. This is belt-and-braces in case someone drops a
+# working copy here while debugging.
+config.ini
+token.json

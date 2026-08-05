@@ -1,0 +1,32 @@
+; Graphical Cloud Manager (gcm) — example configuration
+;
+; This file is an EXAMPLE ONLY and is safe to commit. The real configuration is
+; read from your user directory, never from alongside the binary:
+;
+;   macOS    ~/Library/Application Support/gcm/config.ini
+;   Linux    ~/.config/gcm/config.ini
+;   Windows  %APPDATA%\gcm\config.ini
+;
+; Run gcm once and it will write a template there for you to fill in.
+;
+; Neither value below is a secret: the tenant ID is publicly discoverable from
+; any verified domain, and a public client's ID is sent in plaintext on every
+; authorization request. The credential that DOES matter is the refresh token
+; gcm caches after sign-in, which it writes to token.json in the same directory
+; with owner-only (0600) permissions. Keep real config out of source control so
+; you do not advertise which tenant you administer.
+
+[application]
+client = "CLIENT_ID_HERE"
+tenant = "TENANT_ID_HERE"
+
+; Objects fetched per Graph request (max 999), and a safety valve for very large
+; tenants. max_objects = 0 means fetch everything.
+[query]
+page_size = 999
+max_objects = 0
+
+; Sovereign clouds only — omit this section for worldwide commercial M365.
+; [cloud]
+; authority = "https://login.microsoftonline.us"
+; graph = "https://graph.microsoft.us"
