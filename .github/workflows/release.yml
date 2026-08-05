@@ -150,11 +150,33 @@ jobs:
           if (-not $imports) { throw "could not read the import table of gcm.exe" }
 
           $shipped = Get-ChildItem $dist -Filter *.dll | ForEach-Object { $_.Name.ToLower() }
-          # Present on any supported Windows: the Universal CRT and the core
-          # Win32 and graphics DLLs winit and wgpu/glow bind to.
-          $system = '^(api-ms-win-|ext-ms-win-|kernel32|user32|gdi32|advapi32|shell32|ole32|oleaut32|shlwapi|comdlg32|comctl32|ws2_32|crypt32|secur32|bcrypt|ncrypt|ntdll|rpcrt4|setupapi|cfgmgr32|dwmapi|uxtheme|d3d11|d3d12|dxgi|d3dcompiler_47|opengl32|winmm|imm32|version|userenv|powrprof|propsys|dbghelp|hid|dcomp|msvcrt)\.dll$'
 
-          $missing = $imports | Where-Object { $_ -notmatch $system -and $shipped -notcontains $_ }
+          # The API-set contract DLLs. These are prefixes, matched separately
+          # from the exact names below — folding both into one anchored regex
+          # makes `api-ms-win-` only match the literal string "api-ms-win-.dll",
+          # so every real API-set name fails the check.
+          $systemPrefixes = @('api-ms-win-', 'ext-ms-win-')
+
+          # Present on any supported Windows. uiautomationcore is the UI
+          # Automation provider AccessKit binds to for screen reader support;
+          # combase is COM; bcryptprimitives backs the system RNG.
+          $systemExact = @(
+            'kernel32.dll', 'user32.dll', 'gdi32.dll', 'advapi32.dll', 'shell32.dll',
+            'ole32.dll', 'oleaut32.dll', 'combase.dll', 'shlwapi.dll', 'comdlg32.dll',
+            'comctl32.dll', 'ws2_32.dll', 'crypt32.dll', 'secur32.dll', 'bcrypt.dll',
+            'bcryptprimitives.dll', 'ncrypt.dll', 'ntdll.dll', 'rpcrt4.dll',
+            'setupapi.dll', 'cfgmgr32.dll', 'dwmapi.dll', 'uxtheme.dll',
+            'uiautomationcore.dll', 'oleacc.dll', 'd3d11.dll', 'd3d12.dll',
+            'dxgi.dll', 'd3dcompiler_47.dll', 'opengl32.dll', 'winmm.dll',
+            'imm32.dll', 'version.dll', 'userenv.dll', 'powrprof.dll',
+            'propsys.dll', 'dbghelp.dll', 'hid.dll', 'dcomp.dll', 'msvcrt.dll'
+          )
+
+          $missing = $imports | Where-Object {
+            $name = $_
+            $matchesPrefix = @($systemPrefixes | Where-Object { $name.StartsWith($_) }).Count -gt 0
+            -not $matchesPrefix -and $systemExact -notcontains $name -and $shipped -notcontains $name
+          }
           if ($missing) {
             throw "gcm.exe imports DLLs that are neither part of Windows nor bundled: $($missing -join ', ')"
           }
