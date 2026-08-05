@@ -60,6 +60,48 @@ fn rows(app: &App, view: View) -> (Vec<&'static str>, Vec<Vec<String>>) {
     (headers, rows)
 }
 
+/// Every loaded collection, rendered for the database export.
+///
+/// Two differences from [`rows`], both deliberate:
+///
+/// * **Every view, not just the current one.** A reporting schema wants the
+///   whole tenant in one refresh, not whichever node happened to be selected.
+/// * **Every row, not the filtered set.** A file export answers "give me *this
+///   list*", so the filter belongs in it. A database table narrowed by whatever
+///   somebody typed twenty minutes ago would be a trap for every query that
+///   later joins against it.
+///
+/// Collections the tenant does not offer are skipped rather than written empty:
+/// an empty `gcm_teams` would read as "this tenant has no teams", which is a
+/// different and wrong statement.
+pub fn database_tables(app: &App) -> Vec<crate::mariadb::Table> {
+    View::ALL
+        .iter()
+        .filter_map(|view| {
+            let stem = view.table_stem()?;
+            // Never loaded, or refused by the tenant.
+            if app.store.unavailable(*view).is_some() {
+                return None;
+            }
+            let count = app.store.count(*view)?;
+
+            let columns = list::columns(*view)
+                .iter()
+                .map(|column| column.title.to_string())
+                .collect();
+            let rows = (0..count)
+                .map(|source| list::export_row(app, *view, source))
+                .collect();
+
+            Some(crate::mariadb::Table {
+                stem,
+                columns,
+                rows,
+            })
+        })
+        .collect()
+}
+
 fn to_csv(headers: &[&str], rows: &[Vec<String>]) -> Result<String> {
     let mut writer = csv::Writer::from_writer(Vec::new());
     writer.write_record(headers).context("writing the header")?;

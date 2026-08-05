@@ -680,6 +680,25 @@ pub fn audits() -> Fetch<Arc<Vec<DirectoryAudit>>> {
     ))
 }
 
+/// A synthetic `[mariadb]` section, so the export dialog can be opened and read
+/// without a database to point it at.
+///
+/// The export itself is simulated rather than attempted — see
+/// `App::simulate_database_export`. What this exercises is the part that is
+/// hard to get right and easy to get wrong: whether the dialog names the right
+/// tables, counts the right rows, and says clearly enough that it is about to
+/// replace them.
+pub fn mariadb() -> crate::config::MariaDb {
+    crate::config::MariaDb {
+        host: "db.contoso.internal".into(),
+        port: 3306,
+        user: "gcm_export".into(),
+        database: "m365".into(),
+        table_prefix: "gcm_".into(),
+        require_tls: true,
+    }
+}
+
 /// Whether a `GCM_DEMO_NO_*` switch is set.
 fn unavailable(variable: &str) -> bool {
     std::env::var(variable).is_ok_and(|value| value == "1")

@@ -75,6 +75,7 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
         import_csv: i.consume_key(Modifiers::COMMAND, Key::I),
         export_csv: i.consume_key(Modifiers::COMMAND, Key::E),
         export_json: i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::E),
+        export_database: i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::D),
         // Shift+F10 is the long-standing "open the context menu for whatever is
         // focused" binding; Ctrl+Enter is the fallback for keyboards where F10
         // is claimed by the window manager.
@@ -131,6 +132,9 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
     }
     if pressed.export_json {
         app.export(super::export::Format::Json);
+    }
+    if pressed.export_database {
+        app.export_to_database();
     }
     if pressed.actions {
         app.open_palette();
@@ -221,6 +225,7 @@ struct Pressed {
     import_csv: bool,
     export_csv: bool,
     export_json: bool,
+    export_database: bool,
     actions: bool,
     jump: Option<View>,
 }

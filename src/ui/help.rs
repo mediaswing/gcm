@@ -97,6 +97,7 @@ const GROUPS: &[Group] = &[
             ("{MOD}+F", "Focus the filter box"),
             ("{MOD}+E", "Export the current view to CSV"),
             ("{MOD}+Shift+E", "Export the current view to JSON"),
+            ("{MOD}+Shift+D", "Export every loaded view to MariaDB, if configured"),
             ("{MOD}+I", "Import a CSV, with a preview before anything runs"),
             ("F5", "Refresh the current view"),
             ("{MOD}+Shift+R", "Refresh every view"),

@@ -382,6 +382,67 @@ issued what.
 tail -f ~/Library/Application\ Support/gcm/actions.log | jq .
 ```
 
+### Exporting to MariaDB
+
+`Ctrl+Shift+D`, or the toolbar button that appears once a `[mariadb]` section
+exists. It writes **every loaded view** into one table per collection —
+`gcm_users`, `gcm_licenses`, `gcm_sign_ins` and so on — replacing whatever was
+there.
+
+```ini
+[mariadb]
+host = "db.contoso.internal"
+port = 3306
+user = "gcm_export"
+database = "m365"
+table_prefix = "gcm_"
+require_tls = true
+```
+
+There is deliberately **no password in that file.** gcm asks for it once per
+session, keeps it in memory, and forgets it on sign-out or exit. That is what
+lets `config.ini` go on holding nothing secret, which matters the first time
+somebody pastes it into a support ticket. The password is wrapped in a type
+whose `Debug` prints `<redacted>`, so it cannot reach the error log even by
+accident.
+
+Three things differ from the CSV and JSON exports, all on purpose:
+
+- **Every view, not the current one.** A reporting schema wants the whole tenant
+  in one refresh.
+- **Every row, not the filtered set.** A file export answers "give me *this
+  list*", so the filter belongs in it. A table quietly narrowed by whatever
+  somebody typed twenty minutes ago would be a trap for every query that later
+  joins against it.
+- **Collections the tenant does not offer are skipped**, not written empty. An
+  empty `gcm_teams` would read as "this tenant has no teams", which is a
+  different and wrong statement.
+
+Column types are inferred from the values being written, so `assigned` arrives
+as `BIGINT` and can be summed and `when` arrives as `DATETIME` and can be
+ordered. Inference is conservative: one value that does not fit makes the whole
+column `TEXT`, because a column that is *nearly* a number is worse than one that
+is honestly a string. Values the console shows as `—` are written as `NULL`.
+
+**How a table is replaced.** MariaDB commits implicitly on DDL, so the obvious
+"wrap it all in a transaction" is not available. Each table is instead built
+beside the live one and swapped in:
+
+```sql
+CREATE OR REPLACE TABLE gcm_users__staging (…);
+-- batched INSERTs, inside a transaction
+RENAME TABLE gcm_users TO gcm_users__old, gcm_users__staging TO gcm_users;
+DROP TABLE gcm_users__old;
+```
+
+`RENAME TABLE` is atomic, so a dashboard reading `gcm_users` sees either the
+whole previous export or the whole new one — never a table mid-refill and never
+a missing one.
+
+The database must already exist; gcm creates tables in it, not databases.
+`table_prefix` may not be empty, which is what stops an export from dropping a
+table it did not create.
+
 ### The error log
 
 `actions.log` answers *what did this console change?* — it is an audit trail and
@@ -392,7 +453,7 @@ Failed sign-ins, collections that would not load, features the tenant refused,
 and every failed write, in the order they occurred, one plain-text line each:
 
 ```
-2026-08-05T20:14:02.881Z INFO  [startup] gcm 1.1.0 starting on macos
+2026-08-05T20:14:02.881Z INFO  [startup] gcm 1.2.0 starting on macos
 2026-08-05T20:14:06.204Z INFO  [auth] signed in as admin@contoso.co.uk (writes available)
 2026-08-05T20:14:09.663Z WARN  [sign-ins] This tenant does not expose the sign-in log… ⏎ 403 — …
 2026-08-05T20:15:41.002Z ERROR [action] Delete the group Old Project — 403 — Authorization_RequestDenied
@@ -532,6 +593,7 @@ parent first, so nothing is unreachable.
 | `Ctrl+Enter` | The same, for keyboards where F10 is claimed by the window manager |
 | `Ctrl+Shift+W` | Turn write mode on or off |
 | `Ctrl+N` | Create a user account, from anywhere |
+| `Ctrl+Shift+D` | Export every loaded view to MariaDB |
 
 The actions menu, the right-click menu and the details pane buttons all render
 from one list, so they cannot offer different things. The menu opens even while
@@ -661,6 +723,8 @@ cover still renders instead of becoming a tofu box.
   team, rather than duplicated in the Teams view.
 - The log views show a bounded window — seven days and 500 entries by default —
   not the whole log. The header says so.
+- The MariaDB export replaces its tables outright; there is no append or upsert
+  mode, so it captures current state rather than history.
 - Group and role membership lists display the first 200 entries and then say how
   many more there are.
 - The SKU name table covers the products found in most commercial tenants;

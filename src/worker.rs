@@ -86,6 +86,15 @@ pub enum Command {
     Execute(Box<Action>),
     /// Perform many mutations, one after another.
     ExecuteBatch(Vec<Action>),
+    /// Replace the configured MariaDB tables with the collections given.
+    ///
+    /// The password travels with the command rather than being held by the
+    /// worker, so there is exactly one copy of it in the process and its
+    /// lifetime is the UI's to manage.
+    ExportToDatabase {
+        password: crate::mariadb::Secret,
+        tables: Vec<crate::mariadb::Table>,
+    },
 }
 
 /// Results from the worker back to the UI.
@@ -167,6 +176,10 @@ pub enum Event {
         succeeded: usize,
         failures: Vec<(String, String)>,
     },
+    /// One table of a database export landed.
+    DatabaseProgress { table: String, rows: usize },
+    /// A database export finished, successfully or otherwise.
+    DatabaseDone(Result<String, String>),
 }
 
 /// The UI's handle on the worker thread.
@@ -255,6 +268,12 @@ impl<F: Fn()> Reporter<F> {
                     errorlog::error("batch", &format!("{label} — {message}"));
                 }
             }
+            // Safe to log: the connection is described without its password,
+            // and `Secret` cannot be formatted into a message by accident.
+            Event::DatabaseDone(Ok(summary)) => {
+                errorlog::info("mariadb", &format!("export wrote {summary}"))
+            }
+            Event::DatabaseDone(Err(message)) => errorlog::error("mariadb", message),
             Event::SignedIn {
                 account,
                 writes_available,
@@ -319,6 +338,9 @@ async fn run<F: Fn() + Send + 'static>(
     };
 
     let auth = Authenticator::new(config.clone(), http.clone());
+    // Kept aside before the client takes ownership: the database export needs
+    // the connection details but has nothing to do with Graph.
+    let config_for_export = config.mariadb.clone();
     let mut client = GraphClient::new(config, http, auth);
 
     // Starts locked on every launch and is never persisted, so a console that
@@ -409,6 +431,9 @@ async fn run<F: Fn() + Send + 'static>(
             }
             Command::ExecuteBatch(actions) => {
                 execute_batch(&mut client, &reporter, write_armed, actions).await;
+            }
+            Command::ExportToDatabase { password, tables } => {
+                export_to_database(&config_for_export, &reporter, &password, tables).await;
             }
         }
     }
@@ -518,6 +543,70 @@ async fn execute_batch<F: Fn() + Send + 'static>(
     for collection in touched {
         load_one(client, reporter, collection).await;
     }
+}
+
+/// Replace the configured MariaDB tables.
+///
+/// Runs here rather than on the UI thread for the same reason every Graph call
+/// does: a database on the other side of a VPN can take a long time to answer,
+/// and a frozen window is indistinguishable from a crashed one.
+async fn export_to_database<F: Fn() + Send + 'static>(
+    settings: &Option<crate::config::MariaDb>,
+    reporter: &Reporter<F>,
+    password: &crate::mariadb::Secret,
+    tables: Vec<crate::mariadb::Table>,
+) {
+    let Some(settings) = settings else {
+        // Unreachable through the UI, which hides the command entirely when
+        // the section is absent — but the worker does not assume that.
+        reporter.send(Event::DatabaseDone(Err(
+            "no [mariadb] section is configured".into(),
+        )));
+        return;
+    };
+
+    let total: usize = tables.iter().map(|table| table.rows.len()).sum();
+    let count = tables.len();
+
+    // Progress has to cross from the async export back to the UI, and the
+    // reporter cannot be captured by the callback without borrowing it twice,
+    // so the tables are announced through a channel instead.
+    let (progress_tx, mut progress_rx) = tokio_mpsc::unbounded_channel();
+    let result = {
+        let exporting = crate::mariadb::export(settings, password, tables, move |progress| {
+            let _ = progress_tx.send(progress);
+        });
+        tokio::pin!(exporting);
+        loop {
+            tokio::select! {
+                outcome = &mut exporting => break outcome,
+                Some(progress) = progress_rx.recv() => {
+                    reporter.send(Event::DatabaseProgress {
+                        table: progress.table,
+                        rows: progress.rows,
+                    });
+                }
+            }
+        }
+    };
+    // Anything queued in the moment the export finished.
+    while let Ok(progress) = progress_rx.try_recv() {
+        reporter.send(Event::DatabaseProgress {
+            table: progress.table,
+            rows: progress.rows,
+        });
+    }
+
+    reporter.send(Event::DatabaseDone(match result {
+        Ok(written) => Ok(format!(
+            "{total} rows into {count} tables ({}) at {}",
+            written.join(", "),
+            settings.describe()
+        )),
+        // `{err:#}` walks the context chain, which is what carries "connecting
+        // to …" or "writing gcm_users" alongside the driver's own message.
+        Err(err) => Err(format!("{err:#}")),
+    }));
 }
 
 /// Returns true when sign-in succeeded.

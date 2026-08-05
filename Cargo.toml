@@ -1,6 +1,6 @@
 [package]
 name = "gcm"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 description = "Graphical Cloud Manager — an MMC-style Microsoft 365 admin console"
 license = "MIT"
@@ -15,6 +15,10 @@ eframe = "0.35.0"
 egui = "0.35.0"
 egui_extras = { version = "0.35.0", default-features = false }
 getrandom = "0.4.3"
+# The MariaDB export. rustls rather than the default native-tls, so the whole
+# binary has one TLS stack — the same one reqwest already links — instead of
+# also dragging in OpenSSL or Schannel.
+mysql_async = { version = "0.37.0", default-features = false, features = ["default-rustls-ring", "chrono"] }
 open = "5.4.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "charset", "http2", "query", "form", "gzip", "system-proxy"] }
 rfd = "0.17.2"

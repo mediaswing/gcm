@@ -19,6 +19,7 @@ mod config;
 mod demo;
 mod errorlog;
 mod graph;
+mod mariadb;
 mod importer;
 mod ui;
 mod worker;

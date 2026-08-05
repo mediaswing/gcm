@@ -11,6 +11,12 @@
 //! cached alongside it *is* a bearer credential — see [`crate::auth`], which
 //! writes it 0600. Keeping both in one owner-controlled directory means there is
 //! exactly one place to protect, and no chance of committing either to a repo.
+//!
+//! **Nothing in this file is a secret, and that is a property worth keeping.**
+//! The database export was the first thing that wanted to break it; instead of
+//! storing a password here, gcm asks for one per session and holds it in
+//! memory. The file therefore stays safe to paste into a support ticket, which
+//! is exactly what somebody does when a tenant will not load.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -102,6 +108,112 @@ pub struct Config {
     /// Paging limits.
     #[serde(default)]
     pub query: Query,
+    /// Where the database export writes. Absent when the feature is not used,
+    /// which is the normal case.
+    pub mariadb: Option<MariaDb>,
+}
+
+/// Connection details for the MariaDB export.
+///
+/// Deliberately no password. Everything here is the sort of thing that can sit
+/// in a config file and be pasted into a support ticket — a hostname, a
+/// username, a schema name. The password is asked for once per session and kept
+/// only in memory, which is what lets this file go on holding no secret at all.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MariaDb {
+    pub host: String,
+    #[serde(default = "default_mysql_port")]
+    pub port: u16,
+    pub user: String,
+    /// The schema to write into. It must already exist; gcm creates tables, not
+    /// databases, because creating a database is not a thing an export should
+    /// decide to do on its own.
+    pub database: String,
+    /// Prefix for the tables gcm writes, so its output cannot collide with
+    /// anything already in the schema.
+    #[serde(default = "default_table_prefix")]
+    pub table_prefix: String,
+    /// Require TLS to the database. On by default: this connection carries the
+    /// whole directory, and a password.
+    #[serde(default = "default_true")]
+    pub require_tls: bool,
+}
+
+fn default_mysql_port() -> u16 {
+    3306
+}
+
+fn default_table_prefix() -> String {
+    "gcm_".into()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl MariaDb {
+    /// The connection URL for `mysql_async`.
+    ///
+    /// Takes the password rather than storing it, so there is no field anywhere
+    /// on this struct that must not be printed. Never logged, never shown, and
+    /// never put in an error message — see [`Self::describe`] for the form that
+    /// is safe to display.
+    pub fn url(&self, password: &str) -> String {
+        format!(
+            "mysql://{}:{}@{}:{}/{}",
+            urlencoding::encode(&self.user),
+            urlencoding::encode(password),
+            self.host,
+            self.port,
+            urlencoding::encode(&self.database)
+        )
+    }
+
+    /// The connection as it is safe to print: no password, ever.
+    pub fn describe(&self) -> String {
+        format!(
+            "{}@{}:{}/{}",
+            self.user, self.host, self.port, self.database
+        )
+    }
+
+    /// Full name of the table a view is written to.
+    pub fn table_for(&self, stem: &str) -> String {
+        format!("{}{stem}", self.table_prefix)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.host.trim().is_empty() {
+            bail!("`host` is not set in the [mariadb] section of {}", config_path().display());
+        }
+        if self.user.trim().is_empty() {
+            bail!("`user` is not set in the [mariadb] section of {}", config_path().display());
+        }
+        if self.database.trim().is_empty() {
+            bail!(
+                "`database` is not set in the [mariadb] section of {}",
+                config_path().display()
+            );
+        }
+        // A prefix is what keeps gcm's tables from colliding with whatever else
+        // lives in the schema, so an empty one is refused rather than silently
+        // letting an export drop a table called `users`.
+        if self.table_prefix.trim().is_empty() {
+            bail!(
+                "`table_prefix` in the [mariadb] section of {} must not be empty — it is \
+                 what stops an export from overwriting a table it did not create",
+                config_path().display()
+            );
+        }
+        if !self
+            .table_prefix
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            bail!("`table_prefix` may contain only letters, digits and underscores");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -240,9 +352,27 @@ impl Config {
         if is_placeholder(&self.application.tenant) {
             bail!("`tenant` is not set in {}", path.display());
         }
+        if let Some(mariadb) = &self.mariadb {
+            mariadb.validate()?;
+        }
         Ok(())
     }
 }
+
+/// Make the config file readable only by its owner.
+///
+/// The file holds no secret — that is the point of prompting for the database
+/// password rather than storing it — so this is hygiene rather than protection.
+/// It costs nothing, it matches the token cache and the two logs beside it, and
+/// it means the whole directory can be described with one sentence.
+#[cfg(unix)]
+fn restrict_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn restrict_permissions(_path: &Path) {}
 
 /// True when a value is blank or still carries the shipped placeholder text.
 fn is_placeholder(value: &str) -> bool {
@@ -294,6 +424,21 @@ page_size = 999
 max_objects = 0
 log_days = 7
 log_records = 500
+
+; Optional. Uncomment to enable "Export to MariaDB", which writes every loaded
+; view into one table per collection, replacing what was there before.
+;
+; There is deliberately no password here. gcm asks for it once per session and
+; keeps it only in memory, so this file stays safe to share or paste into a
+; support ticket. The database must already exist; gcm creates tables in it.
+;
+; [mariadb]
+; host = "db.contoso.internal"
+; port = 3306
+; user = "gcm_export"
+; database = "m365"
+; table_prefix = "gcm_"
+; require_tls = true
 
 ; Sovereign clouds only — omit this section for worldwide commercial M365.
 ; [cloud]
@@ -357,6 +502,9 @@ fn write_template(path: &Path) -> Result<()> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     fs::write(path, TEMPLATE).with_context(|| format!("writing {}", path.display()))?;
+    // Written owner-only from the outset, so a password added to it later is
+    // never briefly world-readable.
+    restrict_permissions(path);
     Ok(())
 }
 

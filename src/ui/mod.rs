@@ -5,6 +5,7 @@
 //! keyboard alone — see [`keys`] for the full map.
 
 mod confirm;
+mod database;
 mod details;
 mod export;
 mod forms;
@@ -49,6 +50,22 @@ fn describe_log_window(days: u32, records: usize) -> String {
         other => format!("last {other} days"),
     };
     format!("{period}, most recent {records}")
+}
+
+/// Whether a failed database export looks like the password was wrong.
+///
+/// Worth getting right rather than always forgetting or never forgetting: a
+/// remembered password that is wrong makes every retry fail identically without
+/// ever offering to correct it, and forgetting a *correct* password because the
+/// server was briefly unreachable means typing it again for no reason.
+fn looks_like_a_credential_problem(message: &str) -> bool {
+    let lowered = message.to_lowercase();
+    lowered.contains("access denied")
+        || lowered.contains("authentication")
+        // MySQL 1045 is access-denied-for-user; 1698 is a plugin refusing the
+        // credential it was given.
+        || lowered.contains("1045")
+        || lowered.contains("1698")
 }
 
 /// How far through a batch the worker has got.
@@ -120,6 +137,43 @@ impl View {
             View::AuditLogs => Some(Collection::AuditLogs),
         }
     }
+
+    /// The database table this view is written to, without the configured
+    /// prefix. `None` for the console root, which is a summary rather than a
+    /// collection.
+    ///
+    /// Spelled out rather than derived from [`Self::title`] because a table
+    /// name is part of somebody's schema: renaming a view's heading should
+    /// never silently orphan the table their dashboard queries.
+    pub fn table_stem(self) -> Option<&'static str> {
+        match self {
+            View::Overview => None,
+            View::Users => Some("users"),
+            View::Groups => Some("groups"),
+            View::Roles => Some("roles"),
+            View::Devices => Some("devices"),
+            View::ManagedDevices => Some("managed_devices"),
+            View::Licenses => Some("licenses"),
+            View::Mailboxes => Some("mailboxes"),
+            View::Teams => Some("teams"),
+            View::SignIns => Some("sign_ins"),
+            View::AuditLogs => Some("audit_logs"),
+        }
+    }
+
+    /// Every view that holds a collection, in the order they are exported.
+    pub const ALL: &'static [View] = &[
+        View::Users,
+        View::Groups,
+        View::Roles,
+        View::Devices,
+        View::ManagedDevices,
+        View::Licenses,
+        View::Mailboxes,
+        View::Teams,
+        View::SignIns,
+        View::AuditLogs,
+    ];
 
     /// True for the views that read a log rather than a directory collection.
     ///
@@ -391,6 +445,18 @@ pub struct App {
     palette: Option<menu::Palette>,
     /// A parsed import awaiting the operator's approval.
     import: Option<crate::importer::Plan>,
+    /// Where the database export writes, when it is configured at all.
+    mariadb: Option<crate::config::MariaDb>,
+    /// The database password, for as long as this session lasts.
+    ///
+    /// Deliberately not persisted, and cleared on sign-out along with
+    /// everything else the session knows. Typing it once per run is the price
+    /// of keeping the configuration file free of secrets.
+    mariadb_password: Option<crate::mariadb::Secret>,
+    /// The export dialog, while it is open.
+    database: Option<database::Prompt>,
+    /// Tables written so far by the export in flight.
+    database_progress: Vec<(String, usize)>,
     /// Outcome of the most recent action, shown in the status bar.
     last_action: Option<Result<String, String>>,
     /// A batch in flight.
@@ -407,6 +473,7 @@ impl App {
         let ctx = cc.egui_ctx.clone();
         let tenant_label = config.tenant_id().to_string();
         let log_window = describe_log_window(config.log_days(), config.log_records());
+        let mariadb = config.mariadb.clone();
         let worker = Worker::spawn(config, move || ctx.request_repaint());
 
         let (worker, phase) = match worker {
@@ -444,6 +511,10 @@ impl App {
             form: None,
             palette: None,
             import: None,
+            mariadb,
+            mariadb_password: None,
+            database: None,
+            database_progress: Vec::new(),
             batch: None,
             batch_failures: None,
             last_action: None,
@@ -538,6 +609,12 @@ impl App {
             form: None,
             palette: None,
             import: None,
+            // Demo mode has no worker, so the export is simulated rather than
+            // attempted — the same arrangement as every other write here.
+            mariadb: Some(demo::mariadb()),
+            mariadb_password: None,
+            database: None,
+            database_progress: Vec::new(),
             batch: None,
             batch_failures: None,
             last_action: None,
@@ -573,6 +650,10 @@ impl App {
             form: None,
             palette: None,
             import: None,
+            mariadb: None,
+            mariadb_password: None,
+            database: None,
+            database_progress: Vec::new(),
             batch: None,
             batch_failures: None,
             last_action: None,
@@ -974,6 +1055,10 @@ impl App {
             Event::SignedOut => {
                 self.account = None;
                 self.store = Store::default();
+                // Session state goes with the session. Somebody signing out to
+                // hand the machine over should not leave a database password
+                // behind them.
+                self.mariadb_password = None;
                 self.phase = Phase::SigningInSilently;
                 self.status = "Signing in…".into();
                 self.send(Command::SignIn);
@@ -1106,6 +1191,30 @@ impl App {
                 if !failures.is_empty() {
                     self.batch_failures = Some((succeeded, failures));
                 }
+            }
+            Event::DatabaseProgress { table, rows } => {
+                self.database_progress.push((table.clone(), rows));
+                self.status = format!("Wrote {table} ({rows} rows)…");
+            }
+            Event::DatabaseDone(result) => {
+                match &result {
+                    Ok(summary) => {
+                        self.status = format!("Exported {summary}");
+                        self.last_action = Some(Ok(format!("Exported {summary}")));
+                    }
+                    Err(message) => {
+                        self.status = "Database export failed".into();
+                        self.last_action =
+                            Some(Err(format!("Database export failed — {message}")));
+                        // A refused connection is very often a wrong password,
+                        // and keeping it would mean every retry this session
+                        // failed the same way without ever asking again.
+                        if looks_like_a_credential_problem(message) {
+                            self.mariadb_password = None;
+                        }
+                    }
+                }
+                self.database_progress.clear();
             }
             Event::WriteRejected(label) => {
                 // Only reachable if something bypassed the UI gate; say so
@@ -1423,6 +1532,7 @@ impl eframe::App for App {
             || self.form.is_some()
             || self.palette.is_some()
             || self.import.is_some()
+            || self.database.is_some()
             || self.batch_failures.is_some();
         if !modal_open {
             keys::handle(self, &ctx);
@@ -1585,6 +1695,34 @@ impl App {
             return;
         }
 
+        if let Some(mut prompt) = self.database.take() {
+            // Cloned rather than borrowed: the dialog needs `&mut self` for the
+            // outcome, and the settings live on `self`.
+            let Some(settings) = self.mariadb.clone() else {
+                return;
+            };
+            match database::show(ctx, &mut prompt, &settings, self.mariadb_password.as_ref()) {
+                database::Outcome::Export(password) => {
+                    self.mariadb_password = Some(password.clone());
+                    self.database_progress.clear();
+                    self.status = format!("Exporting to {}…", settings.describe());
+
+                    if self.worker.is_some() {
+                        self.send(Command::ExportToDatabase {
+                            password,
+                            tables: prompt.tables,
+                        });
+                    } else {
+                        #[cfg(debug_assertions)]
+                        self.simulate_database_export(&settings, prompt.tables);
+                    }
+                }
+                database::Outcome::Cancelled => self.status = "Export cancelled".into(),
+                database::Outcome::Pending => self.database = Some(prompt),
+            }
+            return;
+        }
+
         if let Some(plan) = self.import.take() {
             match import::show(ctx, &plan, self.write_mode.is_armed()) {
                 import::Outcome::Apply => self.request_actions(plan.actions),
@@ -1710,6 +1848,22 @@ impl App {
                     self.new_user();
                 }
 
+                // Only when there is somewhere to export to. A button that
+                // exists solely to say "not configured" is worse than no button.
+                if self.mariadb.is_some() {
+                    ui.separator();
+                    if ui
+                        .button("Export to MariaDB")
+                        .on_hover_text(
+                            "Replace the database tables with every loaded view \
+                             (Ctrl+Shift+D)",
+                        )
+                        .clicked()
+                    {
+                        self.export_to_database();
+                    }
+                }
+
                 ui.separator();
 
                 if ui
@@ -1828,6 +1982,63 @@ impl App {
             });
             ui.add_space(2.0);
         });
+    }
+
+    /// Report a database export as though it had run, for demo mode.
+    ///
+    /// Nothing is written anywhere. This exists so the dialog, the progress in
+    /// the status bar and the completion message can be seen without a database
+    /// to point at — the same reason `simulate` exists for tenant writes.
+    #[cfg(debug_assertions)]
+    fn simulate_database_export(
+        &mut self,
+        settings: &crate::config::MariaDb,
+        tables: Vec<crate::mariadb::Table>,
+    ) {
+        let total: usize = tables.iter().map(|table| table.rows.len()).sum();
+        let count = tables.len();
+        let names: Vec<String> = tables
+            .iter()
+            .map(|table| settings.table_for(table.stem))
+            .collect();
+
+        for (name, table) in names.iter().zip(&tables) {
+            self.handle_event(Event::DatabaseProgress {
+                table: name.clone(),
+                rows: table.rows.len(),
+            });
+        }
+        self.handle_event(Event::DatabaseDone(Ok(format!(
+            "{total} rows into {count} tables ({}) at {} — simulated, nothing was written",
+            names.join(", "),
+            settings.describe()
+        ))));
+    }
+
+    /// Open the database export dialog, or explain why there is none.
+    ///
+    /// Unlike a tenant write, this does not require write mode: it changes
+    /// nothing in Microsoft 365. The gate it does have is the dialog, which
+    /// names every table it is about to replace.
+    fn export_to_database(&mut self) {
+        let Some(settings) = self.mariadb.clone() else {
+            self.status = format!(
+                "No [mariadb] section in {} — add one to enable this",
+                config_path().display()
+            );
+            return;
+        };
+
+        let tables = export::database_tables(self);
+        if tables.is_empty() {
+            self.status = "Nothing has finished loading yet, so there is nothing to export"
+                .into();
+            return;
+        }
+
+        let remembered = self.mariadb_password.is_some();
+        self.database = Some(database::Prompt::new(tables, remembered));
+        let _ = settings;
     }
 
     /// Read a CSV and show what it would do. Nothing runs until approved.
