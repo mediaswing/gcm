@@ -11,6 +11,16 @@ on:
 # follows. What it does keep from there is the two things that actually break a
 # release on a clean machine: a real .app bundle on macOS, and the VC++ runtime
 # on Windows.
+#
+# Every action here is pinned to a major that runs on Node 24. The majors differ
+# because the four projects renumber independently, and the version that first
+# *actually* moved to Node 24 is not always the one that announced support for
+# it — upload-artifact v5 and download-artifact v5/v6 shipped Node 24 support
+# while still defaulting to Node 20, so pinning to those would leave the
+# deprecation warning in place. Check `runs.using` in the action's own
+# action.yml before trusting a release note.
+#
+# dtolnay/rust-toolchain is a composite action and has no Node runtime to date.
 
 permissions:
   contents: write
@@ -29,7 +39,7 @@ jobs:
             asset_name: gcm-windows-x86_64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -185,7 +195,7 @@ jobs:
           Compress-Archive -Path $dist -DestinationPath "${{ matrix.asset_name }}.zip"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.asset_name }}.zip
@@ -229,7 +239,7 @@ jobs:
 
       - name: Upload VirusTotal link
         if: hashFiles(format('vt-links/{0}.md', matrix.asset_name)) != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vt-link-${{ matrix.asset_name }}
           path: vt-links/${{ matrix.asset_name }}.md
@@ -240,9 +250,9 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -272,7 +282,7 @@ jobs:
           } > release-notes.md
 
       - name: Attach binaries to the release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: artifacts/**/*.zip
           body_path: release-notes.md
