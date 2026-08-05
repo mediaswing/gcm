@@ -17,6 +17,7 @@ mod auth;
 mod config;
 #[cfg(debug_assertions)]
 mod demo;
+mod errorlog;
 mod graph;
 mod importer;
 mod ui;
@@ -25,6 +26,18 @@ mod worker;
 use ui::{App, FRIENDLY_NAME};
 
 fn main() -> eframe::Result<()> {
+    // First line of the run, so every later entry has a version and a start
+    // time above it. Diagnosing from a log that does not say which build
+    // produced it is guesswork.
+    errorlog::info(
+        "startup",
+        &format!(
+            "gcm {} starting on {}",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS
+        ),
+    );
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(FRIENDLY_NAME)
@@ -55,7 +68,11 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| match config {
             Ok(config) => Ok(Box::new(App::new(cc, config))),
-            Err(err) => Ok(Box::new(App::config_error(cc, format!("{err:#}")))),
+            Err(err) => {
+                let message = format!("{err:#}");
+                errorlog::error("config", &message);
+                Ok(Box::new(App::config_error(cc, message)))
+            }
         }),
     )
 }

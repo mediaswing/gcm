@@ -14,6 +14,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::actionlog;
 use crate::auth::{AuthProgress, Authenticator};
+use crate::errorlog;
 use crate::config::Config;
 use crate::graph::actions::Action;
 use crate::graph::models::*;
@@ -28,6 +29,10 @@ pub enum Collection {
     Devices,
     ManagedDevices,
     Licenses,
+    SignIns,
+    AuditLogs,
+    Teams,
+    Mailboxes,
 }
 
 impl Collection {
@@ -39,6 +44,10 @@ impl Collection {
             Collection::Devices => "Entra devices",
             Collection::ManagedDevices => "Managed devices",
             Collection::Licenses => "Licenses",
+            Collection::SignIns => "Sign-in logs",
+            Collection::AuditLogs => "Audit logs",
+            Collection::Teams => "Teams",
+            Collection::Mailboxes => "Mailboxes",
         }
     }
 }
@@ -57,6 +66,17 @@ pub enum Command {
     RoleMembers { role_id: String },
     /// Fetch the groups and roles a user belongs to.
     UserMemberships { user_id: String },
+    /// Fetch a team's full settings and its channels, for the details pane.
+    /// `/teams` returns only four populated properties, so the rest has to be
+    /// asked for one team at a time.
+    TeamDetail { team_id: String },
+    /// Fetch one mailbox's settings, for the details pane.
+    ///
+    /// `lookup` is what Graph is asked for — an object id where the account is
+    /// loaded, otherwise the UPN, since Graph accepts either. `key` is what the
+    /// answer is filed under, and is always the UPN, because that is the only
+    /// identifier the mailbox usage report carries.
+    MailboxSettings { lookup: String, key: String },
     /// Forget the cached refresh token and sign in again.
     SignOut,
     /// Arm or disarm write mode. The worker keeps its own copy of this and
@@ -92,6 +112,23 @@ pub enum Event {
     /// Managed devices, or the reason the tenant cannot supply them.
     ManagedDevices(Fetch<Arc<Vec<ManagedDevice>>>),
     Licenses(Arc<Vec<SubscribedSku>>),
+    /// Recent sign-ins, or the reason the tenant cannot supply them.
+    SignIns(Fetch<Arc<Vec<SignIn>>>),
+    /// Recent directory changes, or the reason they are unavailable.
+    AuditLogs(Fetch<Arc<Vec<DirectoryAudit>>>),
+    Teams(Fetch<Arc<Vec<Team>>>),
+    Mailboxes(Fetch<Arc<Vec<Mailbox>>>),
+    /// A team's full settings and channel list.
+    TeamDetail {
+        team_id: String,
+        team: Box<Fetch<Team>>,
+        channels: Arc<Vec<Channel>>,
+    },
+    /// One mailbox's settings, keyed by the owner's UPN.
+    MailboxSettings {
+        key: String,
+        settings: Box<Fetch<crate::graph::models::MailboxSettings>>,
+    },
     GroupMembers {
         group_id: String,
         members: Arc<Vec<DirectoryMember>>,
@@ -189,7 +226,63 @@ struct Reporter<F: Fn()> {
 }
 
 impl<F: Fn()> Reporter<F> {
+    /// Send an event, recording anything that went wrong in the diagnostic log
+    /// on the way past.
+    ///
+    /// Routing it through here rather than at each call site is what makes the
+    /// log complete: every failure the UI is told about reaches this function
+    /// by construction, so none can be added later and quietly go unrecorded.
     fn send(&self, event: Event) {
+        match &event {
+            Event::Fatal(message) => errorlog::error("worker", message),
+            Event::Failed {
+                collection,
+                message,
+            } => {
+                let area = collection.map(Collection::label).unwrap_or("tenant");
+                errorlog::error(area, message);
+            }
+            Event::WriteRejected(label) => errorlog::warn(
+                "write-gate",
+                &format!("refused {label} — write mode is not armed"),
+            ),
+            Event::ActionResult {
+                label,
+                result: Err(message),
+            } => errorlog::error("action", &format!("{label} — {message}")),
+            Event::BatchDone { failures, .. } if !failures.is_empty() => {
+                for (label, message) in failures {
+                    errorlog::error("batch", &format!("{label} — {message}"));
+                }
+            }
+            Event::SignedIn {
+                account,
+                writes_available,
+            } => errorlog::info(
+                "auth",
+                &format!(
+                    "signed in as {} (writes {})",
+                    account.as_deref().unwrap_or("unknown"),
+                    if *writes_available {
+                        "available"
+                    } else {
+                        "refused"
+                    }
+                ),
+            ),
+            // A tenant that does not offer a feature is a normal state, but it
+            // is also the single most common thing somebody opens this log to
+            // understand — "why is this view empty?"
+            Event::ManagedDevices(Fetch::Unavailable(reason)) => {
+                errorlog::warn("managed-devices", reason)
+            }
+            Event::SignIns(Fetch::Unavailable(reason)) => errorlog::warn("sign-ins", reason),
+            Event::AuditLogs(Fetch::Unavailable(reason)) => errorlog::warn("audit-logs", reason),
+            Event::Teams(Fetch::Unavailable(reason)) => errorlog::warn("teams", reason),
+            Event::Mailboxes(Fetch::Unavailable(reason)) => errorlog::warn("mailboxes", reason),
+            _ => {}
+        }
+
         let _ = self.tx.send(event);
         (self.repaint)();
     }
@@ -276,6 +369,34 @@ async fn run<F: Fn() + Send + 'static>(
                     Event::UserMemberships {
                         user_id,
                         memberships: Arc::new(memberships),
+                    }
+                });
+            }
+            Command::TeamDetail { team_id } => {
+                let team = client.team(&team_id).await;
+                // Channels are a separate read and a separate permission, so a
+                // team whose settings are refused can still list its channels
+                // and vice versa. Losing both because one failed would be worse
+                // than showing whichever half arrived.
+                let channels = client.team_channels(&team_id).await;
+                match team {
+                    Ok(team) => reporter.send(Event::TeamDetail {
+                        team_id,
+                        team: Box::new(team),
+                        channels: Arc::new(channels.unwrap_or_default()),
+                    }),
+                    Err(err) => reporter.send(Event::Failed {
+                        collection: Some(Collection::Teams),
+                        message: format!("{err:#}"),
+                    }),
+                }
+            }
+            Command::MailboxSettings { lookup, key } => {
+                let result = client.mailbox_settings(&lookup).await;
+                reporter.report(Collection::Mailboxes, result, |settings| {
+                    Event::MailboxSettings {
+                        key,
+                        settings: Box::new(settings),
                     }
                 });
             }
@@ -462,6 +583,9 @@ async fn load_all<F: Fn() + Send + 'static>(client: &mut GraphClient, reporter: 
         }),
     }
 
+    // Directory first, then the workloads, then the logs. The order is what an
+    // operator sees fill in, and the logs are both the slowest and the least
+    // likely to be what somebody opened the console for.
     for collection in [
         Collection::Users,
         Collection::Groups,
@@ -469,6 +593,10 @@ async fn load_all<F: Fn() + Send + 'static>(client: &mut GraphClient, reporter: 
         Collection::Devices,
         Collection::ManagedDevices,
         Collection::Licenses,
+        Collection::Mailboxes,
+        Collection::Teams,
+        Collection::SignIns,
+        Collection::AuditLogs,
     ] {
         load_one(client, reporter, collection).await;
     }
@@ -503,15 +631,43 @@ async fn load_one<F: Fn() + Send + 'static>(
         Collection::ManagedDevices => {
             let result = client.managed_devices().await;
             reporter.report(collection, result, |fetch| {
-                Event::ManagedDevices(match fetch {
-                    Fetch::Ready(devices) => Fetch::Ready(Arc::new(devices)),
-                    Fetch::Unavailable(reason) => Fetch::Unavailable(reason),
-                })
+                Event::ManagedDevices(share(fetch))
             });
         }
         Collection::Licenses => {
             let result = client.subscribed_skus().await;
             reporter.report(collection, result, |skus| Event::Licenses(Arc::new(skus)));
         }
+        Collection::SignIns => {
+            let result = client.sign_ins().await;
+            reporter.report(collection, result, |fetch| {
+                Event::SignIns(share(fetch))
+            });
+        }
+        Collection::AuditLogs => {
+            let result = client.directory_audits().await;
+            reporter.report(collection, result, |fetch| {
+                Event::AuditLogs(share(fetch))
+            });
+        }
+        Collection::Teams => {
+            let result = client.teams().await;
+            reporter.report(collection, result, |fetch| Event::Teams(share(fetch)));
+        }
+        Collection::Mailboxes => {
+            let result = client.mailboxes().await;
+            reporter.report(collection, result, |fetch| {
+                Event::Mailboxes(share(fetch))
+            });
+        }
+    }
+}
+
+/// Move a fetched collection behind an `Arc` so the UI can clone a handle per
+/// frame rather than the rows themselves.
+fn share<T>(fetch: Fetch<Vec<T>>) -> Fetch<Arc<Vec<T>>> {
+    match fetch {
+        Fetch::Ready(items) => Fetch::Ready(Arc::new(items)),
+        Fetch::Unavailable(reason) => Fetch::Unavailable(reason),
     }
 }

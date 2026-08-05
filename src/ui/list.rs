@@ -76,6 +76,42 @@ const LICENSE_COLUMNS: &[Column] = &[
     col("Usage", 1.6),
 ];
 
+const MAILBOX_COLUMNS: &[Column] = &[
+    col("Name", 2.2),
+    col("Mailbox", 2.6),
+    col("Size", 1.8),
+    col("Items", 0.9),
+    col("Last activity", 1.3),
+    col("Usage", 1.6),
+];
+
+const TEAM_COLUMNS: &[Column] = &[
+    col("Team", 2.4),
+    col("Description", 3.2),
+    col("Visibility", 1.2),
+    col("State", 1.0),
+];
+
+// A timestamp is a fixed 16 characters and is the column somebody reads first,
+// so it gets the width to render whole rather than being the one that clips.
+const SIGN_IN_COLUMNS: &[Column] = &[
+    col("When", 2.0),
+    col("User", 2.4),
+    col("Application", 2.0),
+    col("Result", 1.0),
+    col("Risk", 1.0),
+    col("Location", 1.5),
+];
+
+const AUDIT_COLUMNS: &[Column] = &[
+    col("When", 2.0),
+    col("Activity", 2.4),
+    col("Category", 1.5),
+    col("Initiated by", 2.2),
+    col("Target", 1.8),
+    col("Result", 1.0),
+];
+
 pub fn columns(view: View) -> &'static [Column] {
     match view {
         View::Overview => &[],
@@ -85,6 +121,22 @@ pub fn columns(view: View) -> &'static [Column] {
         View::Devices => DEVICE_COLUMNS,
         View::ManagedDevices => MANAGED_COLUMNS,
         View::Licenses => LICENSE_COLUMNS,
+        View::Mailboxes => MAILBOX_COLUMNS,
+        View::Teams => TEAM_COLUMNS,
+        View::SignIns => SIGN_IN_COLUMNS,
+        View::AuditLogs => AUDIT_COLUMNS,
+    }
+}
+
+/// Which column of a view is drawn as a usage bar rather than as text.
+///
+/// Two views have one, and both the table and the export need to agree about
+/// where it is — a mismatch would export a blank column and nobody would look
+/// at it twice.
+fn bar_column(view: View) -> Option<usize> {
+    match view {
+        View::Licenses | View::Mailboxes => Some(columns(view).len() - 1),
+        _ => None,
     }
 }
 
@@ -153,12 +205,75 @@ fn cell(app: &App, view: View, source: usize, column: usize) -> String {
             },
             None => String::new(),
         },
+        View::Mailboxes => match mailboxes(app).get(source) {
+            Some(mailbox) => match column {
+                0 => mailbox.name().to_string(),
+                1 => mailbox.upn().to_string(),
+                2 => mailbox.storage_display(),
+                3 => mailbox.item_count.to_string(),
+                4 => fmt_day(&mailbox.last_activity),
+                _ => String::new(), // drawn as a bar
+            },
+            None => String::new(),
+        },
+        View::Teams => match teams(app).get(source) {
+            Some(team) => match column {
+                0 => team.name().to_string(),
+                1 => fmt_opt(&team.description),
+                2 => team.visibility_display(),
+                _ => team.state().to_string(),
+            },
+            None => String::new(),
+        },
+        View::SignIns => match sign_ins(app).get(source) {
+            Some(sign_in) => match column {
+                0 => fmt_date(&sign_in.created_date_time),
+                1 => sign_in.upn().to_string(),
+                2 => fmt_opt(&sign_in.app_display_name),
+                3 => sign_in.outcome().to_string(),
+                4 => sign_in.risk_display(),
+                _ => sign_in.location_display(),
+            },
+            None => String::new(),
+        },
+        View::AuditLogs => match audits(app).get(source) {
+            Some(audit) => match column {
+                0 => fmt_date(&audit.activity_date_time),
+                1 => audit.activity().to_string(),
+                2 => fmt_opt(&audit.category),
+                3 => audit.actor(),
+                4 => audit.target(),
+                _ => audit.result_display(),
+            },
+            None => String::new(),
+        },
     }
 }
 
 fn managed(app: &App) -> &[ManagedDevice] {
-    match &app.store.managed {
-        Some(Fetch::Ready(devices)) => devices.as_slice(),
+    ready(&app.store.managed)
+}
+
+fn mailboxes(app: &App) -> &[Mailbox] {
+    ready(&app.store.mailboxes)
+}
+
+fn teams(app: &App) -> &[Team] {
+    ready(&app.store.teams)
+}
+
+fn sign_ins(app: &App) -> &[SignIn] {
+    ready(&app.store.sign_ins)
+}
+
+fn audits(app: &App) -> &[DirectoryAudit] {
+    ready(&app.store.audits)
+}
+
+/// The rows of a collection the tenant may not offer, or nothing.
+fn ready<T>(fetch: &Option<Fetch<std::sync::Arc<Vec<T>>>>) -> &[T] {
+    match fetch {
+        Some(Fetch::Ready(items)) => items.as_slice(),
         _ => &[],
     }
 }
@@ -216,6 +331,39 @@ pub fn sku_matches(sku: &SubscribedSku, needle: &str) -> bool {
         || sku.part_number().to_lowercase().contains(needle)
 }
 
+pub fn mailbox_matches(mailbox: &Mailbox, needle: &str) -> bool {
+    mailbox.name().to_lowercase().contains(needle)
+        || mailbox.upn().to_lowercase().contains(needle)
+}
+
+pub fn team_matches(team: &Team, needle: &str) -> bool {
+    team.name().to_lowercase().contains(needle)
+        || contains(&team.description, needle)
+        || team.visibility_display().to_lowercase().contains(needle)
+        // So that typing "archived" narrows to the archived ones, which is the
+        // filter somebody actually wants here.
+        || team.state().to_lowercase().contains(needle)
+}
+
+pub fn sign_in_matches(sign_in: &SignIn, needle: &str) -> bool {
+    sign_in.name().to_lowercase().contains(needle)
+        || contains(&sign_in.user_principal_name, needle)
+        || contains(&sign_in.app_display_name, needle)
+        || contains(&sign_in.ip_address, needle)
+        || sign_in.location_display().to_lowercase().contains(needle)
+        // "failure" and "at risk" are the two things anybody types here.
+        || sign_in.outcome().to_lowercase().contains(needle)
+        || sign_in.risk_display().to_lowercase().contains(needle)
+}
+
+pub fn audit_matches(audit: &DirectoryAudit, needle: &str) -> bool {
+    audit.activity().to_lowercase().contains(needle)
+        || contains(&audit.category, needle)
+        || audit.actor().to_lowercase().contains(needle)
+        || audit.target().to_lowercase().contains(needle)
+        || audit.result_display().to_lowercase().contains(needle)
+}
+
 // ---- Rendering -------------------------------------------------------------
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
@@ -227,13 +375,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let view = app.view;
     header(app, ui, view);
 
-    // A tenant that has not licensed Intune gets an explanation, not an
-    // empty table that looks like a bug.
-    if view == View::ManagedDevices
-        && let Some(Fetch::Unavailable(reason)) = &app.store.managed
-    {
-        let reason = reason.clone();
-        unavailable(ui, &reason);
+    // A tenant that has not licensed Intune — or Teams, or Entra ID P1 — gets
+    // an explanation, not an empty table that looks like a bug.
+    if let Some(reason) = app.store.unavailable(view) {
+        let reason = reason.to_string();
+        unavailable(ui, view, &reason);
         return;
     }
 
@@ -268,6 +414,21 @@ fn header(app: &mut App, ui: &mut egui::Ui, view: View) {
             format!("{shown} of {total} items")
         };
         ui.label(RichText::new(caption).color(theme::MUTED));
+
+        // A log view shows a window, not a collection. Saying so is the
+        // difference between "there were 500 sign-ins" and "here are the most
+        // recent 500 of however many there were".
+        if view.is_log() {
+            ui.label(
+                RichText::new(app.log_window_caption())
+                    .small()
+                    .color(theme::MUTED),
+            )
+            .on_hover_text(
+                "Both limits come from the [query] section of config.ini — log_days \
+                 and log_records.",
+            );
+        }
 
         if app.store.is_loading(view) {
             ui.spinner();
@@ -500,10 +661,10 @@ fn row(app: &mut App, ui: &mut egui::Ui, view: View, row_index: usize, widths: &
 
     let mut x = rect.left() + MARK_GUTTER;
     for (index, width) in widths.iter().enumerate() {
-        // The licence usage column is a bar, not text.
-        if view == View::Licenses && index == widths.len() - 1 {
-            if let Some(sku) = app.store.licenses.get(source) {
-                usage_bar(ui, rect, x, *width, sku, selected);
+        // Licence seats and mailbox quota are drawn as a bar, not as text.
+        if bar_column(view) == Some(index) {
+            if let Some(fraction) = usage_fraction(app, view, source) {
+                usage_bar(ui, rect, x, *width, fraction, selected);
             }
             break;
         }
@@ -516,6 +677,17 @@ fn row(app: &mut App, ui: &mut egui::Ui, view: View, row_index: usize, widths: &
                 View::Users if index == 4 => theme::status_color(&text),
                 View::Devices if index == 3 => theme::status_color(&text),
                 View::ManagedDevices if index == 3 => theme::status_color(&text),
+                View::Teams if index == 3 => theme::status_color(&text),
+                // A failed sign-in and a risky one are the two rows somebody is
+                // scanning a thousand of these for.
+                View::SignIns if index == 3 => theme::status_color(&text),
+                View::SignIns if index == 4 => {
+                    match sign_ins(app).get(source) {
+                        Some(sign_in) if sign_in.is_risky() => theme::BAD,
+                        _ => default_color,
+                    }
+                }
+                View::AuditLogs if index == 5 => theme::status_color(&text),
                 _ => default_color,
             }
         };
@@ -687,11 +859,9 @@ pub fn export_row(app: &App, view: View, source: usize) -> Vec<String> {
     let cols = columns(view);
     (0..cols.len())
         .map(|index| {
-            if view == View::Licenses && index == cols.len() - 1 {
-                app.store
-                    .licenses
-                    .get(source)
-                    .map(|sku| format!("{:.0}%", sku.usage_fraction() * 100.0))
+            if bar_column(view) == Some(index) {
+                usage_fraction(app, view, source)
+                    .map(|fraction| format!("{:.0}%", fraction * 100.0))
                     .unwrap_or_default()
             } else {
                 cell(app, view, source, index)
@@ -710,15 +880,10 @@ pub fn row_label(app: &App, view: View, source: usize) -> String {
     let cols = columns(view);
     (0..cols.len())
         .map(|index| {
-            let value = cell(app, view, source, index);
-            if view == View::Licenses && index == cols.len() - 1 {
-                app.store
-                    .licenses
-                    .get(source)
-                    .map(|sku| format!("{} of {} seats used", sku.consumed(), sku.total_seats()))
-                    .unwrap_or_default()
+            if bar_column(view) == Some(index) {
+                usage_text(app, view, source)
             } else {
-                format!("{}: {}", cols[index].title, value)
+                format!("{}: {}", cols[index].title, cell(app, view, source, index))
             }
         })
         .filter(|part| !part.is_empty())
@@ -726,15 +891,48 @@ pub fn row_label(app: &App, view: View, source: usize) -> String {
         .join(", ")
 }
 
+/// How full the thing in this row is, for whichever view draws a bar.
+fn usage_fraction(app: &App, view: View, source: usize) -> Option<f32> {
+    match view {
+        View::Licenses => app.store.licenses.get(source).map(|sku| sku.usage_fraction()),
+        View::Mailboxes => mailboxes(app).get(source).map(|mb| mb.usage_fraction()),
+        _ => None,
+    }
+}
+
+/// The same figure as words, for the export and for a screen reader — a bar
+/// conveys nothing to either.
+fn usage_text(app: &App, view: View, source: usize) -> String {
+    match view {
+        View::Licenses => app
+            .store
+            .licenses
+            .get(source)
+            .map(|sku| format!("{} of {} seats used", sku.consumed(), sku.total_seats()))
+            .unwrap_or_default(),
+        View::Mailboxes => mailboxes(app)
+            .get(source)
+            .map(|mailbox| match mailbox.quota() {
+                0 => format!("{} used, no quota set", fmt_bytes(mailbox.storage_used)),
+                quota => format!(
+                    "{} of {} used",
+                    fmt_bytes(mailbox.storage_used),
+                    fmt_bytes(quota)
+                ),
+            })
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 fn usage_bar(
     ui: &mut egui::Ui,
     row_rect: Rect,
     x: f32,
     width: f32,
-    sku: &SubscribedSku,
+    fraction: f32,
     selected: bool,
 ) {
-    let fraction = sku.usage_fraction();
     let bar = Rect::from_min_size(
         egui::pos2(x, row_rect.center().y - 5.0),
         Vec2::new((width - 60.0).max(20.0), 10.0),
@@ -764,16 +962,32 @@ fn usage_bar(
     );
 }
 
-fn unavailable(ui: &mut egui::Ui, reason: &str) {
+/// The pane shown when the tenant does not offer this view.
+///
+/// Three layers, in descending order of levity and ascending order of use: the
+/// quip, the plain-English remedy, then whatever Graph actually said. Somebody
+/// who wants only the last of those can skip straight to it — see
+/// [`super::quips`] for why the first is allowed to exist at all.
+fn unavailable(ui: &mut egui::Ui, view: View, reason: &str) {
     ui.add_space(24.0);
     ui.vertical_centered(|ui| {
-        ui.label(RichText::new("Not available in this tenant").size(15.0).strong());
+        ui.label(
+            RichText::new(super::quips::unavailable(view))
+                .size(15.0)
+                .strong(),
+        );
         ui.add_space(10.0);
         ui.allocate_ui_with_layout(
-            Vec2::new(520.0, 0.0),
+            Vec2::new(560.0, 0.0),
             Layout::top_down(Align::Center),
             |ui| {
-                ui.label(RichText::new(reason).color(theme::MUTED));
+                ui.label(RichText::new(super::quips::remedy(view)));
+                ui.add_space(14.0);
+                ui.label(
+                    RichText::new(reason)
+                        .small()
+                        .color(theme::MUTED),
+                );
             },
         );
     });
@@ -826,15 +1040,12 @@ fn overview(app: &mut App, ui: &mut egui::Ui) {
                         pair(ui, "Tenant type", &fmt_opt(&org.tenant_type));
                         pair(ui, "Country", &fmt_opt(&org.country_letter_code));
                         pair(ui, "Created", &fmt_date(&org.created_date_time));
-                        pair(
-                            ui,
-                            "Intune",
-                            if org.has_intune() {
-                                "Enabled"
-                            } else {
-                                "Not enabled"
-                            },
-                        );
+                        let provisioned = |present: bool| {
+                            if present { "Enabled" } else { "Not enabled" }
+                        };
+                        pair(ui, "Intune", provisioned(org.has_intune()));
+                        pair(ui, "Exchange Online", provisioned(org.has_exchange()));
+                        pair(ui, "Microsoft Teams", provisioned(org.has_teams()));
                         pair(
                             ui,
                             "Verified domains",
@@ -863,9 +1074,19 @@ fn overview(app: &mut App, ui: &mut egui::Ui) {
             });
 
             ui.add_space(20.0);
+            ui.label(RichText::new("WORKLOADS AND MONITORING").small().color(theme::MUTED));
+            ui.add_space(8.0);
+
+            ui.horizontal_wrapped(|ui| {
+                for view in [View::Mailboxes, View::Teams, View::SignIns, View::AuditLogs] {
+                    tile(app, ui, view);
+                }
+            });
+
+            ui.add_space(20.0);
             ui.label(
                 RichText::new(
-                    "Choose a node in the console tree, or press Ctrl+1 to Ctrl+6. \
+                    "Choose a node in the console tree, or press Ctrl+1 to Ctrl+9. \
                      Press F1 for the full list of shortcuts.",
                 )
                 .color(theme::MUTED),
@@ -882,9 +1103,12 @@ fn tile(app: &App, ui: &mut egui::Ui, view: View) {
             ui.vertical(|ui| {
                 ui.label(RichText::new(view.title()).color(theme::MUTED).small());
                 ui.add_space(2.0);
+                // "n/a" for a collection the tenant refused, an em dash for one
+                // still on its way — the two look identical in an empty table
+                // and mean completely different things.
                 let value = match app.store.count(view) {
                     Some(count) => count.to_string(),
-                    None if view == View::ManagedDevices => "n/a".into(),
+                    None if app.store.unavailable(view).is_some() => "n/a".into(),
                     None => "—".into(),
                 };
                 ui.label(RichText::new(value).size(22.0).strong());

@@ -2,8 +2,9 @@
 
 A Microsoft 365 administration console for the desktop, written in Rust. It
 presents users, groups and directory roles, Entra and Intune-managed devices,
-and licence consumption in the shape of a classic MMC snap-in: a scope tree on
-the left, a result list in the middle, a property sheet on the right.
+licence consumption, Exchange mailboxes, Teams, and the sign-in and audit logs
+in the shape of a classic MMC snap-in: a scope tree on the left, a result list
+in the middle, a property sheet on the right.
 
 Everything in it is reachable from the keyboard. It opens **read-only every
 time**, and changing anything requires deliberately arming write mode — see
@@ -19,6 +20,10 @@ time**, and changing anything requires deliberately arming write mode — see
 │ ▾ Devices    │ │ …                         │ │ Job title …      │
 │     Managed  │ └───────────────────────────┘ │ MEMBER OF …      │
 │   Licenses   │                               │                  │
+│   Exchange   │                               │                  │
+│   Teams      │                               │                  │
+│ ▾ Monitoring │                               │                  │
+│     Audit    │                               │                  │
 └──────────────┴───────────────────────────────┴──────────────────┘
   Ready                    Contoso · Focus: Results · F1 shortcuts
 ```
@@ -33,14 +38,46 @@ time**, and changing anything requires deliberately arming write mode — see
 | **Entra Devices** | Registered and joined devices, with join type (Entra joined, hybrid joined, Entra registered), compliance, and last sign-in. |
 | **Managed Devices** | Intune enrolments: compliance state, management agent, ownership, hardware, encryption and supervision, storage and last check-in. Degrades to a clear explanation when the tenant has no Intune — see below. |
 | **Licenses** | Every subscribed SKU with a friendly product name, seats purchased, assigned and available, a usage bar, and the service plans inside each SKU. Over-assignment is called out rather than shown as a negative number. |
+| **Exchange** | Every mailbox with size against quota, item count and last activity, fullest first. Details add all three quota thresholds, archive state, deleted-item volume, and the mailbox's time zone, language and automatic replies. |
+| **Teams** | Every team with visibility and archived state. Details add channels with their addresses, what members and guests are allowed to do, messaging and Giphy settings, and a link straight into the Teams client. |
+| **Sign-in Logs** | Recent sign-ins with the user, application, outcome, risk state and location. Details add the failure code and reason, the device and its compliance, Conditional Access outcome, and the correlation ID to quote at Microsoft support. |
+| **Audit Logs** | Recent directory changes: what happened, in which category, who did it, to what, and whether it worked — with the before-and-after values of each modified property. |
 
-### When the tenant has no Intune
+### Where the mailbox list comes from
 
-Tenants without Intune, and app registrations without the device-management
-scope, both answer `403` on the managed-device endpoints. gcm treats that as a
-state to report, not an error to raise: the Managed Devices view explains which
-of the two it is and the rest of the console carries on working. Every other
-collection loads independently, so one failure never blanks the window.
+Graph has no collection that lists mailboxes; `/users` knows about accounts, not
+about the mailboxes behind them. The Exchange view therefore reads the
+`getMailboxUsageDetail` report, which is the only v1.0 endpoint that enumerates
+them — and which happens to carry exactly the numbers somebody opens Exchange to
+check. It arrives as CSV rather than JSON, addressed by column name rather than
+position, because Microsoft has changed the column set before.
+
+Two consequences worth knowing. The report is compiled daily, so a mailbox
+created this morning will not appear until tomorrow. And a tenant with *Reports
+→ Display concealed user information* switched on returns anonymised
+identifiers instead of names; gcm says so in the details pane rather than
+leaving you to wonder why every mailbox looks like a serial number.
+
+### What Graph cannot do to Exchange
+
+Mailbox permissions, forwarding rules, litigation hold, retention policies and
+transport rules are Exchange Online PowerShell, not Graph. They are not here,
+and no amount of consent will make them appear. What Graph *does* expose —
+mailbox size, quota, activity and automatic replies — is what this view offers.
+
+### When the tenant does not have something
+
+Several views depend on things a tenant may simply not have: Intune, Exchange,
+Teams, or Entra ID P1 for the sign-in log. All of them answer `403` — sometimes
+`404`, occasionally a `400` whose text mentions a licence — and gcm treats every
+one as a state to report rather than an error to raise.
+
+Each such view explains itself in three layers: a dry one-line headline, the
+plain-English fix beneath it, and the exact response Graph gave at the bottom.
+The headline is allowed to be funny; the two lines under it are not, and the
+rule that keeps them apart is enforced by a test. The rest of the console
+carries on regardless — every collection loads independently, so one refusal
+never blanks the window.
 
 ## Requirements
 
@@ -73,6 +110,15 @@ In the Entra admin centre, under **App registrations → New registration**:
    | `Device.Read.All` | Entra devices |
    | `DeviceManagementManagedDevices.Read.All` | Intune devices |
    | `Organization.Read.All` | Tenant summary and licences |
+   | `AuditLog.Read.All` | Sign-in and audit logs |
+   | `Team.ReadBasic.All` | The list of teams |
+   | `TeamSettings.Read.All` | An individual team's settings and archived state |
+   | `Channel.ReadBasic.All` | A team's channels |
+   | `Reports.Read.All` | The mailbox list, via the usage report |
+   | `MailboxSettings.Read` | Automatic replies and mailbox preferences |
+
+   Anything you leave out simply shows as unavailable in that view; gcm still
+   runs, and says which permission is missing.
 
    Write — only needed if you want gcm to change anything. Omit them and it
    runs read-only, which it will tell you at sign-in:
@@ -86,6 +132,19 @@ In the Entra admin centre, under **App registrations → New registration**:
    | `DeviceManagementManagedDevices.ReadWrite.All` | Intune device changes |
    | `DeviceManagementManagedDevices.PrivilegedOperations.All` | Retire, wipe, remote lock, Autopilot reset |
    | `UserAuthenticationMethod.ReadWrite.All` | Password reset |
+   | `TeamSettings.ReadWrite.All` | Archiving and restoring a team |
+   | `MailboxSettings.ReadWrite` | Setting somebody's automatic replies |
+
+   Creating users rides on `User.ReadWrite.All`; deleting a team rides on
+   `Group.ReadWrite.All`, since a team is deleted by deleting its group.
+
+   > **Delegated access to other people's mailboxes.** `MailboxSettings.Read`
+   > delegated reaches your own mailbox and any you have been granted rights
+   > over — not, in general, every mailbox in the tenant. The mailbox *list*
+   > comes from the usage report and is unaffected; the per-mailbox settings
+   > pane is the part that may be refused, and it says so when it is. Reading
+   > every mailbox needs the `MailboxSettings.Read` **application** permission,
+   > which is a different app registration shape from the one described here.
 
 4. Copy the **Application (client) ID** and **Directory (tenant) ID**.
 
@@ -208,12 +267,67 @@ destroyed — which is the mistake that actually happens.
 
 | Object | Available now |
 | --- | --- |
-| User | Enable/disable · edit job title, department, office, mobile, usage location · reset password · assign/remove licence · add to / remove from group · delete |
+| User | **Create** · enable/disable · edit job title, department, office, mobile, usage location · reset password · assign/remove licence · add to / remove from group · delete |
 | Group | Create · rename and edit description · add/remove members · add/remove owners · delete |
 | Entra device | Enable/disable · delete |
+| Intune device | Sync · restart · remote lock · rename · Autopilot reset · retire · wipe · delete the enrolment record |
+| Team | Archive · restore · delete |
+| Mailbox | Turn automatic replies on or off, with separate internal and external messages |
 
-Still to come: Intune device actions (sync, restart, retire, wipe) and CSV/JSON
-export.
+### Creating a user
+
+`Ctrl+N` from anywhere, or the **New user…** button in the toolbar. The form
+asks for a display name and a sign-in name, splitting the latter into an alias
+and a domain chosen from the tenant's *verified* domains — Graph rejects
+anything else, and picking from a list cannot be got wrong.
+
+Three details worth calling out:
+
+- **The password is generated, shown once, and never stored.** Same alphabet as
+  a password reset, so it survives being read aloud over the phone. Copy it
+  before confirming.
+- **The alias is checked here, not by Graph.** Entra rejects an invalid sign-in
+  name with a `Request_BadRequest` that names neither the property nor the
+  offending character, which is a miserable thing to debug from a dialog.
+- **Usage location is optional but load-bearing.** A licence cannot be assigned
+  without one, so the form asks up front rather than letting the first licence
+  assignment fail confusingly.
+
+The account is created disabled if you untick *Can sign in immediately*, which
+is the right answer for one prepared ahead of a start date.
+
+### Managing teams
+
+Archive makes a team read-only in the Teams client — nobody can post, nothing is
+removed, and it can be restored at any time. gcm also sets the SharePoint site
+read-only for members, because a team you cannot post in but whose files you can
+still edit is not what anyone means by "archived".
+
+Delete is a different matter. Graph has no endpoint that deletes a team; a team
+is deleted by deleting the Microsoft 365 group behind it, which takes the group,
+its mailbox, its SharePoint site and every channel conversation with it. The
+confirmation says so, and demands the team's name typed out.
+
+Team *membership* is held on that same backing group, so it is edited under
+Groups rather than duplicated here.
+
+### The sign-in and audit logs
+
+Both views read a window rather than a collection, and the header says which:
+`last 7 days, most recent 500` by default, configurable as `log_days` and
+`log_records` under `[query]`.
+
+Both bounds are deliberate. Microsoft's own guidance is that an unfiltered call
+to the sign-in log times out on a busy tenant, so a time filter is always
+applied. And even one day of sign-ins can run to six figures on a large tenant,
+which this console would hold entirely in memory. Entra keeps at most 30 days of
+sign-ins without an Entra ID P2 licence, so `log_days` is clamped there.
+
+The sign-in log needs three separate things and will refuse until it has all of
+them: Entra ID P1 or P2 on the tenant, `AuditLog.Read.All` on the app
+registration, and a reporting role — Reports Reader, Security Reader or Global
+Reader — on the *signed-in account*. The last of those catches people out,
+because it is not a consent setting.
 
 ### Bulk operations
 
@@ -267,6 +381,36 @@ issued what.
 ```sh
 tail -f ~/Library/Application\ Support/gcm/actions.log | jq .
 ```
+
+### The error log
+
+`actions.log` answers *what did this console change?* — it is an audit trail and
+records only writes. `error.log`, beside it, answers the different question you
+ask when something is misbehaving: *what actually happened?*
+
+Failed sign-ins, collections that would not load, features the tenant refused,
+and every failed write, in the order they occurred, one plain-text line each:
+
+```
+2026-08-05T20:14:02.881Z INFO  [startup] gcm 1.1.0 starting on macos
+2026-08-05T20:14:06.204Z INFO  [auth] signed in as admin@contoso.co.uk (writes available)
+2026-08-05T20:14:09.663Z WARN  [sign-ins] This tenant does not expose the sign-in log… ⏎ 403 — …
+2026-08-05T20:15:41.002Z ERROR [action] Delete the group Old Project — 403 — Authorization_RequestDenied
+```
+
+Find it next to `config.ini`, or open it from **Keyboard help** (`F1`) — and
+from the failure screen, which is where you will want it if gcm cannot start at
+all. It is written `0600`, trimmed once it passes 512 KB, and keeps the *most
+recent* entries when it trims, since those are the ones being diagnosed.
+
+The two files are kept apart deliberately: mixing diagnostics into the audit
+trail would bury the handful of lines saying who deleted what under a running
+commentary of throttling and permission errors.
+
+It contains no tokens and no passwords — nothing that logs is ever handed a
+request body — and anything token-shaped that reaches a message anyway is
+redacted before it is written, because a diagnostic file is exactly the thing
+somebody emails to a vendor.
 
 ### The limit of the write gate
 
@@ -373,9 +517,12 @@ Press **F1** in the app for the same table. On macOS, `Ctrl` below is `Cmd`.
 **Jumping**
 
 `Ctrl+0` Console Root · `Ctrl+1` Users · `Ctrl+2` Groups · `Ctrl+3` Directory
-Roles · `Ctrl+4` Devices · `Ctrl+5` Managed Devices · `Ctrl+6` Licenses
+Roles · `Ctrl+4` Devices · `Ctrl+5` Managed Devices · `Ctrl+6` Licenses ·
+`Ctrl+7` Exchange · `Ctrl+8` Teams · `Ctrl+9` Sign-in Logs
 
-Jumping to a nested node expands its parent first, so nothing is unreachable.
+The numbers follow the scope tree top to bottom, so they are a position rather
+than something to memorise separately. Jumping to a nested node expands its
+parent first, so nothing is unreachable.
 
 **Acting on the selection**
 
@@ -384,6 +531,7 @@ Jumping to a nested node expands its parent first, so nothing is unreachable.
 | `Shift+F10` | Open the actions menu for the selection — the keyboard equivalent of right-clicking |
 | `Ctrl+Enter` | The same, for keyboards where F10 is claimed by the window manager |
 | `Ctrl+Shift+W` | Turn write mode on or off |
+| `Ctrl+N` | Create a user account, from anywhere |
 
 The actions menu, the right-click menu and the details pane buttons all render
 from one list, so they cannot offer different things. The menu opens even while
@@ -436,9 +584,17 @@ To see the console without a tenant — useful for working on the interface or
 checking the keyboard model:
 
 ```sh
-GCM_DEMO=1 cargo run                  # synthetic tenant
-GCM_DEMO_NO_INTUNE=1 GCM_DEMO=1 cargo run   # ...with Intune unavailable
+GCM_DEMO=1 cargo run                            # synthetic tenant
+GCM_DEMO=1 GCM_DEMO_NO_INTUNE=1 cargo run       # ...without Intune
+GCM_DEMO=1 GCM_DEMO_NO_EXCHANGE=1 cargo run     # ...without Exchange
+GCM_DEMO=1 GCM_DEMO_NO_TEAMS=1 cargo run        # ...without Teams
+GCM_DEMO=1 GCM_DEMO_NO_AUDIT=1 cargo run        # ...without Entra ID P1
 ```
+
+The `NO_*` switches exist so the unavailable-feature paths can be exercised
+offline. Otherwise they are only reachable by finding a tenant that genuinely
+lacks the thing, which is not a practical way to check that a message reads
+well.
 
 Demo mode is `#[cfg(debug_assertions)]` throughout. It does not exist in a
 release build and cannot be switched on in one.
@@ -459,21 +615,52 @@ tree's flattening and reachability.
 | Module | Responsibility |
 | --- | --- |
 | `config` | Loads the INI from the user directory; writes the template on first run. |
-| `auth` | Device code flow, refresh-token cache, silent renewal. |
-| `graph` | Paged Graph client, resource models, SKU name table. |
-| `worker` | Owns the Tokio runtime; the UI talks to it over command/event channels and never blocks or awaits. |
-| `ui` | The console: `nav` (scope tree), `list` (virtualized results), `details` (property sheet), `keys` (shortcuts), `help`, `theme`. |
+| `auth` | Authorization code flow with PKCE, refresh-token cache, silent renewal. |
+| `graph` | Paged Graph client, resource models, SKU name table, `reports` (the CSV usage reports), `actions` (every mutation, as data). |
+| `worker` | Owns the Tokio runtime; the UI talks to it over command/event channels and never blocks or awaits. Also the single choke point every write passes through. |
+| `actionlog` | The audit trail: one JSON line per attempted write. |
+| `errorlog` | The diagnostic log: everything that failed or was refused. |
+| `ui` | The console: `nav` (scope tree), `list` (virtualized results), `details` (property sheet), `forms` and `confirm` (the input and approval halves of an action), `menu` (what can be done to an object, in one place), `keys`, `help`, `quips`, `theme`. |
 
 The result list is virtualized and builds only the rows on screen, so a tenant
 with fifty thousand users costs the same per frame as one with fifty. Group and
-role membership is fetched on demand rather than up front — expanding every
-group eagerly would be thousands of requests for data nobody asked for.
+role membership, team settings and mailbox settings are all fetched on demand
+rather than up front — expanding every group eagerly would be thousands of
+requests for data nobody asked for.
+
+Two files exist mainly to stop things drifting apart. `menu` is the single
+source for what can be done to an object, so the right-click menu, the details
+pane button bar and the keyboard palette cannot offer different things.
+`quips` holds every "this is not available here" message, because tone drifts
+when it lives in a dozen places, and a file of jokes is easy to read end to end
+and ask whether any of them have aged badly.
+
+### The typography
+
+The interface is set in Ubuntu Bold, bundled in `assets/fonts` under the Ubuntu
+Font Licence. egui ships only Ubuntu-Light, and `RichText::strong()` recolours
+rather than selecting a heavier face, so the bold weight has to arrive as an
+actual font file. It goes first in the proportional family's chain, with
+everything egui already had left behind it — so a glyph Ubuntu Bold does not
+cover still renders instead of becoming a tofu box.
 
 ## Limitations
 
-- Read-only by design. There is no create, edit, assign or remove.
 - Long values in narrow columns are clipped; the details pane always shows the
   full value.
+- Exchange administration is limited to what Graph exposes: mailbox size, quota,
+  activity and automatic replies. Permissions, forwarding, litigation hold and
+  transport rules are Exchange Online PowerShell only.
+- The mailbox list comes from a report compiled daily, so a mailbox created this
+  morning appears tomorrow.
+- Automatic replies can be switched on and off but not *scheduled*. A schedule
+  needs a start and end instant in the mailbox's own time zone, and a console
+  that got that subtly wrong would stop answering somebody's mail on the wrong
+  day.
+- Team membership is edited under Groups, on the Microsoft 365 group behind the
+  team, rather than duplicated in the Teams view.
+- The log views show a bounded window — seven days and 500 entries by default —
+  not the whole log. The header says so.
 - Group and role membership lists display the first 200 entries and then say how
   many more there are.
 - The SKU name table covers the products found in most commercial tenants;
@@ -484,3 +671,7 @@ group eagerly would be thousands of requests for data nobody asked for.
 ## Licence
 
 MIT — see [LICENSE](LICENSE).
+
+The bundled Ubuntu Bold typeface is used under the Ubuntu Font Licence 1.0, a
+copy of which sits beside it in
+[`assets/fonts`](assets/fonts/UBUNTU-FONT-LICENCE-1.0.txt).

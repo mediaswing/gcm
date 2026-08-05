@@ -74,6 +74,40 @@ pub fn entries(expanded: &HashSet<&'static str>) -> Vec<Entry> {
         expandable: None,
     });
 
+    // Workloads sit below the directory, in the order an administrator is most
+    // likely to want them: mail before chat.
+    entries.push(Entry {
+        label: "Exchange",
+        view: View::Mailboxes,
+        depth: 1,
+        expandable: None,
+    });
+
+    entries.push(Entry {
+        label: "Teams",
+        view: View::Teams,
+        depth: 1,
+        expandable: None,
+    });
+
+    // Both logs live under one node, because "check the logs" is one thought
+    // and neither is worth a top-level slot on its own.
+    entries.push(Entry {
+        label: "Monitoring",
+        view: View::SignIns,
+        depth: 1,
+        expandable: Some("monitoring"),
+    });
+
+    if expanded.contains("monitoring") {
+        entries.push(Entry {
+            label: "Audit Logs",
+            view: View::AuditLogs,
+            depth: 2,
+            expandable: None,
+        });
+    }
+
     entries
 }
 
@@ -87,6 +121,7 @@ pub fn parent_of(view: View) -> Option<&'static str> {
     match view {
         View::Roles => Some("groups"),
         View::ManagedDevices => Some("devices"),
+        View::AuditLogs => Some("monitoring"),
         _ => None,
     }
 }
@@ -336,19 +371,31 @@ mod tests {
         keys.iter().copied().collect()
     }
 
+    /// Every parent key the tree knows about.
+    const ALL_PARENTS: &[&str] = &["groups", "devices", "monitoring"];
+
     #[test]
     fn collapsed_tree_hides_children() {
         let tree = entries(&expanded(&[]));
         let labels: Vec<_> = tree.iter().map(|e| e.label).collect();
         assert_eq!(
             labels,
-            ["Console Root", "Users", "Groups", "Devices", "Licenses"]
+            [
+                "Console Root",
+                "Users",
+                "Groups",
+                "Devices",
+                "Licenses",
+                "Exchange",
+                "Teams",
+                "Monitoring",
+            ]
         );
     }
 
     #[test]
     fn expanding_reveals_children_in_order() {
-        let tree = entries(&expanded(&["groups", "devices"]));
+        let tree = entries(&expanded(ALL_PARENTS));
         let labels: Vec<_> = tree.iter().map(|e| e.label).collect();
         assert_eq!(
             labels,
@@ -360,6 +407,10 @@ mod tests {
                 "Devices",
                 "Managed Devices",
                 "Licenses",
+                "Exchange",
+                "Teams",
+                "Monitoring",
+                "Audit Logs",
             ]
         );
     }
@@ -369,18 +420,20 @@ mod tests {
         // Roles are unreachable while their parent is collapsed.
         assert_eq!(index_of(&expanded(&[]), View::Roles), None);
         assert_eq!(index_of(&expanded(&["groups"]), View::Roles), Some(3));
+        assert_eq!(index_of(&expanded(&[]), View::AuditLogs), None);
     }
 
     #[test]
     fn children_know_their_parent() {
         assert_eq!(parent_of(View::Roles), Some("groups"));
         assert_eq!(parent_of(View::ManagedDevices), Some("devices"));
+        assert_eq!(parent_of(View::AuditLogs), Some("monitoring"));
         assert_eq!(parent_of(View::Users), None);
     }
 
     #[test]
     fn every_view_except_overview_appears_when_fully_expanded() {
-        let tree = entries(&expanded(&["groups", "devices"]));
+        let tree = entries(&expanded(ALL_PARENTS));
         for view in [
             View::Users,
             View::Groups,
@@ -388,10 +441,32 @@ mod tests {
             View::Devices,
             View::ManagedDevices,
             View::Licenses,
+            View::Mailboxes,
+            View::Teams,
+            View::SignIns,
+            View::AuditLogs,
         ] {
             assert!(
                 tree.iter().any(|e| e.view == view),
                 "{view:?} is unreachable from the scope tree"
+            );
+        }
+    }
+
+    /// A nested node reached by a shortcut has its parent expanded first, using
+    /// [`parent_of`]. A child whose parent key were wrong would jump to a node
+    /// the tree never reveals, leaving the cursor somewhere else entirely.
+    #[test]
+    fn every_nested_node_names_a_real_parent() {
+        let tree = entries(&expanded(ALL_PARENTS));
+        for entry in tree.iter().filter(|entry| entry.depth > 1) {
+            let parent = parent_of(entry.view).unwrap_or_else(|| {
+                panic!("{} is nested but names no parent", entry.label)
+            });
+            assert!(
+                tree.iter().any(|e| e.expandable == Some(parent)),
+                "{} names a parent key nothing expands: {parent}",
+                entry.label
             );
         }
     }

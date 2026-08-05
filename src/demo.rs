@@ -48,6 +48,11 @@ pub fn organization() -> Organization {
                 service_plan_id: None,
                 capability_status: Some("Enabled".into()),
             },
+            AssignedPlan {
+                service: Some("TeamspaceAPI".into()),
+                service_plan_id: None,
+                capability_status: Some("Enabled".into()),
+            },
             // Keep the tenant summary consistent with the managed devices
             // below, unless GCM_DEMO_NO_INTUNE is deliberately turning them off.
             AssignedPlan {
@@ -226,7 +231,7 @@ pub fn devices() -> Arc<Vec<Device>> {
 
 /// Set `GCM_DEMO_NO_INTUNE=1` to exercise the unavailable-feature path.
 pub fn managed_devices() -> Fetch<Arc<Vec<ManagedDevice>>> {
-    if std::env::var("GCM_DEMO_NO_INTUNE").is_ok_and(|value| value == "1") {
+    if unavailable("GCM_DEMO_NO_INTUNE") {
         return Fetch::Unavailable(
             "This tenant does not expose Intune managed devices. Either Intune is not \
              licensed here, or the app registration has not been granted \
@@ -325,6 +330,359 @@ pub fn licenses() -> Arc<Vec<SubscribedSku>> {
             })
             .collect(),
     )
+}
+
+/// Set `GCM_DEMO_NO_TEAMS=1` to exercise the unavailable-feature path.
+pub fn teams() -> Fetch<Arc<Vec<Team>>> {
+    if unavailable("GCM_DEMO_NO_TEAMS") {
+        return Fetch::Unavailable(
+            "This tenant does not expose Microsoft Teams. Either Teams is not licensed \
+             here, or the app registration has not been granted Team.ReadBasic.All.\n\n\
+             403 — Forbidden: Insufficient privileges to complete the operation."
+                .into(),
+        );
+    }
+
+    let specs = [
+        ("All Company", "public", false),
+        ("Finance Team", "private", false),
+        ("Project Falcon", "private", false),
+        ("Project Kestrel", "private", true),
+        ("Service Desk", "public", false),
+    ];
+
+    Fetch::Ready(Arc::new(
+        specs
+            .iter()
+            .enumerate()
+            .map(|(index, (name, visibility, archived))| Team {
+                id: format!("team-{index:04}"),
+                display_name: Some((*name).into()),
+                description: Some(format!("{name} — demonstration team")),
+                visibility: Some((*visibility).into()),
+                is_archived: Some(*archived),
+                ..Default::default()
+            })
+            .collect(),
+    ))
+}
+
+/// Full settings for one team, as `GET /teams/{id}` would return them.
+pub fn team_detail(team: &Team) -> (Fetch<Team>, Arc<Vec<Channel>>) {
+    let channels = ["General", "Planning", "Deployments", "Random"];
+    let channels: Vec<Channel> = channels
+        .iter()
+        .enumerate()
+        .map(|(index, name)| Channel {
+            id: format!("{}-channel-{index:04}", team.id),
+            display_name: Some((*name).into()),
+            description: (index == 1).then(|| "Sprint planning and retros".to_string()),
+            membership_type: Some(if index == 2 { "private" } else { "standard" }.into()),
+            email: Some(format!(
+                "{}@contoso.co.uk",
+                name.to_lowercase().replace(' ', ".")
+            )),
+            created_date_time: ago(500 - index as i64 * 30),
+        })
+        .collect();
+
+    let full = Team {
+        classification: Some("Internal".into()),
+        specialization: Some("none".into()),
+        created_date_time: ago(600),
+        web_url: Some(format!("https://teams.microsoft.com/l/team/{}", team.id)),
+        member_settings: Some(TeamMemberSettings {
+            allow_create_update_channels: Some(true),
+            allow_delete_channels: Some(false),
+            allow_add_remove_apps: Some(true),
+            allow_create_update_remove_tabs: Some(true),
+            allow_create_update_remove_connectors: Some(false),
+        }),
+        guest_settings: Some(TeamGuestSettings {
+            allow_create_update_channels: Some(false),
+            allow_delete_channels: Some(false),
+        }),
+        messaging_settings: Some(TeamMessagingSettings {
+            allow_user_edit_messages: Some(true),
+            allow_user_delete_messages: Some(true),
+            allow_owner_delete_messages: Some(true),
+            allow_team_mentions: Some(true),
+            allow_channel_mentions: Some(true),
+        }),
+        fun_settings: Some(TeamFunSettings {
+            allow_giphy: Some(true),
+            giphy_content_rating: Some("moderate".into()),
+            allow_stickers_and_memes: Some(true),
+            allow_custom_memes: Some(false),
+        }),
+        ..team.clone()
+    };
+
+    (Fetch::Ready(full), Arc::new(channels))
+}
+
+/// Set `GCM_DEMO_NO_EXCHANGE=1` to exercise the unavailable-feature path.
+pub fn mailboxes() -> Fetch<Arc<Vec<Mailbox>>> {
+    if unavailable("GCM_DEMO_NO_EXCHANGE") {
+        return Fetch::Unavailable(
+            "This tenant does not expose the mailbox usage report. Either Exchange \
+             Online is not licensed here, or the app registration has not been granted \
+             Reports.Read.All.\n\n403 — Forbidden: Insufficient privileges."
+                .into(),
+        );
+    }
+
+    const GIGABYTE: i64 = 1_073_741_824;
+    let people = [
+        ("Aisha Rahman", "aisha.rahman", 94, 21_403),
+        ("Ben Okafor", "ben.okafor", 31, 8_120),
+        ("Chloe Duval", "chloe.duval", 68, 15_902),
+        ("Dmitri Sokolov", "dmitri.sokolov", 12, 3_004),
+        ("Elena Marsh", "elena.marsh", 3, 210),
+        ("Grace Lin", "grace.lin", 99, 44_781),
+    ];
+
+    let mut mailboxes: Vec<Mailbox> = people
+        .iter()
+        .enumerate()
+        .map(|(index, (name, alias, percent, items))| {
+            let quota = 100 * GIGABYTE;
+            Mailbox {
+                user_principal_name: format!("{alias}@contoso.co.uk"),
+                display_name: (*name).into(),
+                is_deleted: false,
+                created: ago(900 - index as i64 * 40).map(|dt| dt.date_naive()),
+                // A mailbox nobody has ever opened has no last activity at all,
+                // which is a case the pane has to render.
+                last_activity: (index != 4).then(|| {
+                    (chrono::Utc::now() - Duration::days(index as i64)).date_naive()
+                }),
+                item_count: *items,
+                storage_used: quota / 100 * *percent,
+                issue_warning_quota: quota / 100 * 90,
+                prohibit_send_quota: quota / 100 * 98,
+                prohibit_send_receive_quota: quota,
+                deleted_item_count: *items / 20,
+                deleted_item_size: GIGABYTE / 2,
+                has_archive: Some(index % 2 == 0),
+            }
+        })
+        .collect();
+
+    // Fullest first, matching what the real client does with the report.
+    mailboxes.sort_by(|a, b| b.usage_fraction().total_cmp(&a.usage_fraction()));
+    Fetch::Ready(Arc::new(mailboxes))
+}
+
+/// Mailbox settings for one mailbox, with an out-of-office on the busiest one.
+pub fn mailbox_settings(upn: &str) -> Fetch<MailboxSettings> {
+    if upn.starts_with("dmitri") {
+        // Not every mailbox is readable with a delegated sign-in, and the pane
+        // has to say so gracefully.
+        return Fetch::Unavailable(
+            "These mailbox settings are not readable with the current sign-in.\n\n\
+             403 — ErrorAccessDenied: Access is denied. Check credentials and try again."
+                .into(),
+        );
+    }
+
+    let on = upn.starts_with("elena");
+    Fetch::Ready(MailboxSettings {
+        time_zone: Some("GMT Standard Time".into()),
+        date_format: Some("dd/MM/yyyy".into()),
+        time_format: Some("HH:mm".into()),
+        language: Some(LocaleInfo {
+            locale: Some("en-GB".into()),
+            display_name: Some("English (United Kingdom)".into()),
+        }),
+        user_purpose: Some(serde_json::json!("user")),
+        automatic_replies_setting: Some(AutomaticReplies {
+            status: Some(if on { "alwaysEnabled" } else { "disabled" }.into()),
+            external_audience: Some("all".into()),
+            scheduled_start_date_time: None,
+            scheduled_end_date_time: None,
+            internal_reply_message: on.then(|| {
+                "<html><body><p>On parental leave until March.<br>Please contact \
+                 the People team.</p></body></html>"
+                    .to_string()
+            }),
+            external_reply_message: on.then(|| {
+                "<html><body><p>On leave. Please contact people@contoso.co.uk.</p>\
+                 </body></html>"
+                    .to_string()
+            }),
+        }),
+    })
+}
+
+/// Set `GCM_DEMO_NO_AUDIT=1` to exercise the unavailable-feature path, which is
+/// the common case on a tenant without Entra ID P1.
+pub fn sign_ins() -> Fetch<Arc<Vec<SignIn>>> {
+    if unavailable("GCM_DEMO_NO_AUDIT") {
+        return Fetch::Unavailable(
+            "This tenant does not expose the sign-in log. It needs Microsoft Entra ID \
+             P1 or P2, the app registration needs AuditLog.Read.All, and the signed-in \
+             account needs a role that can read reports.\n\n403 — \
+             Authentication_RequestFromUnsupportedUserRole: Neither tenant is B2C or \
+             tenant doesn't have premium license"
+                .into(),
+        );
+    }
+
+    let specs = [
+        ("Aisha Rahman", "aisha.rahman", "Microsoft Teams", 0, "none", "London"),
+        ("Ben Okafor", "ben.okafor", "Office 365 Exchange Online", 0, "none", "Leeds"),
+        ("Grace Lin", "grace.lin", "Azure Portal", 50126, "none", "London"),
+        ("Jonah Whitfield", "jonah.whitfield", "Microsoft Graph", 53003, "atRisk", "Lagos"),
+        ("Liam Byrne", "liam.byrne", "Windows Sign In", 0, "none", "London"),
+        ("Chloe Duval", "chloe.duval", "SharePoint Online", 0, "remediated", "Leeds"),
+        ("Grace Lin", "grace.lin", "Azure Portal", 0, "none", "London"),
+        ("Elena Marsh", "elena.marsh", "Microsoft Teams", 50058, "none", "Manchester"),
+    ];
+
+    Fetch::Ready(Arc::new(
+        specs
+            .iter()
+            .enumerate()
+            .map(|(index, (name, alias, app, error, risk, city))| SignIn {
+                id: format!("signin-{index:04}"),
+                created_date_time: Some(
+                    chrono::Utc::now() - Duration::hours(index as i64 * 3 + 1),
+                ),
+                user_display_name: Some((*name).into()),
+                user_principal_name: Some(format!("{alias}@contoso.co.uk")),
+                app_display_name: Some((*app).into()),
+                resource_display_name: Some("Microsoft Graph".into()),
+                ip_address: Some(format!("203.0.113.{}", 10 + index)),
+                client_app_used: Some("Browser".into()),
+                correlation_id: Some(format!("cccccccc-0000-0000-0000-{index:012}")),
+                conditional_access_status: Some(
+                    if *error == 0 { "success" } else { "failure" }.into(),
+                ),
+                is_interactive: Some(true),
+                risk_state: Some((*risk).into()),
+                risk_level_during_sign_in: Some(
+                    if *risk == "atRisk" { "medium" } else { "none" }.into(),
+                ),
+                risk_detail: Some("none".into()),
+                status: Some(SignInStatus {
+                    error_code: Some(*error),
+                    failure_reason: (*error != 0).then(|| {
+                        match error {
+                            50126 => "Invalid username or password.",
+                            53003 => "Access has been blocked by Conditional Access policies.",
+                            _ => "The user did not complete multi-factor authentication.",
+                        }
+                        .to_string()
+                    }),
+                    additional_details: None,
+                }),
+                device_detail: Some(SignInDevice {
+                    device_id: Some(format!("aaaaaaaa-0000-0000-0000-{index:012}")),
+                    display_name: Some(format!("LON-LT-{index:04}")),
+                    operating_system: Some("Windows 10".into()),
+                    browser: Some("Edge 131.0".into()),
+                    is_compliant: Some(*error == 0),
+                    is_managed: Some(true),
+                    trust_type: Some("AzureAd".into()),
+                }),
+                location: Some(SignInLocation {
+                    city: Some((*city).into()),
+                    state: Some("England".into()),
+                    country_or_region: Some("GB".into()),
+                }),
+            })
+            .collect(),
+    ))
+}
+
+pub fn audits() -> Fetch<Arc<Vec<DirectoryAudit>>> {
+    if unavailable("GCM_DEMO_NO_AUDIT") {
+        return Fetch::Unavailable(
+            "This tenant does not expose the directory audit log. The app registration \
+             needs AuditLog.Read.All, and the signed-in account needs a role that can \
+             read reports.\n\n403 — Authorization_RequestDenied: Insufficient \
+             privileges to complete the operation."
+                .into(),
+        );
+    }
+
+    let specs = [
+        ("Add member to group", "GroupManagement", "Finance Team", "success"),
+        ("Update user", "UserManagement", "Ben Okafor", "success"),
+        ("Reset user password", "UserManagement", "Chloe Duval", "success"),
+        ("Add member to role", "RoleManagement", "Liam Byrne", "success"),
+        ("Delete group", "GroupManagement", "Old Project", "success"),
+        ("Update device", "DeviceManagement", "LON-LT-0042", "failure"),
+        ("Disable account", "UserManagement", "Jonah Whitfield", "success"),
+    ];
+
+    Fetch::Ready(Arc::new(
+        specs
+            .iter()
+            .enumerate()
+            .map(|(index, (activity, category, target, result))| DirectoryAudit {
+                id: format!("audit-{index:04}"),
+                activity_date_time: Some(
+                    chrono::Utc::now() - Duration::hours(index as i64 * 5 + 2),
+                ),
+                activity_display_name: Some((*activity).into()),
+                category: Some((*category).into()),
+                correlation_id: Some(format!("dddddddd-0000-0000-0000-{index:012}")),
+                result: Some((*result).into()),
+                result_reason: (*result == "failure")
+                    .then(|| "Insufficient privileges to complete the operation".to_string()),
+                logged_by_service: Some("Core Directory".into()),
+                operation_type: Some(if activity.starts_with("Add") {
+                    "Add"
+                } else {
+                    "Update"
+                }
+                .into()),
+                // Alternating between a person and an application, because both
+                // shapes appear in a real log and the pane renders them
+                // differently.
+                initiated_by: Some(AuditInitiator {
+                    user: (index % 3 != 2).then(|| AuditUser {
+                        id: Some("user-0000".into()),
+                        display_name: Some("Aisha Rahman".into()),
+                        user_principal_name: Some("aisha.rahman@contoso.co.uk".into()),
+                        ip_address: Some("203.0.113.10".into()),
+                    }),
+                    app: (index % 3 == 2).then(|| AuditApp {
+                        app_id: Some("00000003-0000-0000-c000-000000000000".into()),
+                        display_name: Some("Microsoft Approval Management".into()),
+                        service_principal_name: None,
+                    }),
+                }),
+                target_resources: vec![AuditTargetResource {
+                    id: Some(format!("object-{index:04}")),
+                    display_name: Some((*target).into()),
+                    resource_type: Some(if category.starts_with("Group") {
+                        "Group"
+                    } else {
+                        "User"
+                    }
+                    .into()),
+                    user_principal_name: None,
+                    modified_properties: vec![AuditModifiedProperty {
+                        display_name: Some("AccountEnabled".into()),
+                        old_value: Some("\"true\"".into()),
+                        new_value: Some("\"false\"".into()),
+                    }],
+                }],
+                additional_details: vec![AuditKeyValue {
+                    key: Some("User-Agent".into()),
+                    value: Some(concat!("gcm/", env!("CARGO_PKG_VERSION")).into()),
+                }],
+            })
+            .collect(),
+    ))
+}
+
+/// Whether a `GCM_DEMO_NO_*` switch is set.
+fn unavailable(variable: &str) -> bool {
+    std::env::var(variable).is_ok_and(|value| value == "1")
 }
 
 pub fn members(count: usize, seed: usize) -> Arc<Vec<DirectoryMember>> {

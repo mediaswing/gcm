@@ -12,7 +12,7 @@ use egui::RichText;
 
 use super::{Store, theme};
 use crate::graph::actions::{
-    Action, DeviceOp, GroupPatch, GroupSpec, MemberRole, UserPatch,
+    Action, AutoReplySpec, DeviceOp, GroupPatch, GroupSpec, MemberRole, UserPatch, UserSpec,
 };
 
 /// Length of a generated password. Long enough to satisfy any tenant policy
@@ -65,7 +65,40 @@ pub struct UserFields {
     pub usage_location: String,
 }
 
+/// Everything the create-user form gathers before it becomes a [`UserSpec`].
+pub struct NewUserFields {
+    pub display_name: String,
+    /// Alias part of the sign-in name, before the `@`.
+    pub alias: String,
+    /// Domain part, chosen from the tenant's verified domains.
+    pub domain: String,
+    pub job_title: String,
+    pub department: String,
+    pub usage_location: String,
+    pub account_enabled: bool,
+    pub password: String,
+    /// Set once the operator edits the alias by hand, after which it stops
+    /// tracking the display name.
+    pub alias_edited: bool,
+}
+
 pub enum Form {
+    CreateUser {
+        fields: Box<NewUserFields>,
+    },
+    /// Somebody's out-of-office. `on` is separate from the message so that
+    /// turning replies off does not require clearing what they wrote.
+    AutomaticReplies {
+        id: String,
+        name: String,
+        on: bool,
+        internal: String,
+        external: String,
+        audience: String,
+        /// True when the two messages are kept identical, which is what most
+        /// people want and nobody wants to type twice.
+        same_message: bool,
+    },
     EditUser {
         id: String,
         name: String,
@@ -134,8 +167,59 @@ impl Form {
         }
     }
 
+    pub fn create_user() -> Self {
+        Form::CreateUser {
+            fields: Box::new(NewUserFields {
+                display_name: String::new(),
+                alias: String::new(),
+                domain: String::new(),
+                job_title: String::new(),
+                department: String::new(),
+                usage_location: String::new(),
+                // A new account is expected to be usable; somebody preparing one
+                // ahead of a start date can untick it.
+                account_enabled: true,
+                password: generate_password(),
+                alias_edited: false,
+            }),
+        }
+    }
+
+    /// Seed the automatic-replies form from whatever the mailbox has set now,
+    /// so opening it and saving without typing changes nothing.
+    pub fn automatic_replies(
+        id: String,
+        name: String,
+        current: Option<crate::graph::models::AutomaticReplies>,
+    ) -> Self {
+        let internal = current
+            .as_ref()
+            .map(|replies| replies.internal_text())
+            .unwrap_or_default();
+        let external = current
+            .as_ref()
+            .map(|replies| replies.external_text())
+            .unwrap_or_default();
+        Form::AutomaticReplies {
+            id,
+            name,
+            on: current.as_ref().is_some_and(|replies| replies.is_on()),
+            same_message: internal == external,
+            audience: current
+                .as_ref()
+                .and_then(|replies| replies.external_audience.clone())
+                .unwrap_or_else(|| "all".into()),
+            internal,
+            external,
+        }
+    }
+
     fn title(&self) -> String {
         match self {
+            Form::CreateUser { .. } => "New user".into(),
+            Form::AutomaticReplies { name, .. } => {
+                format!("Automatic replies for {name}")
+            }
             Form::EditUser { name, .. } => format!("Edit {name}"),
             Form::ResetPassword { name, .. } => format!("Reset the password for {name}"),
             Form::CreateGroup { .. } => "Create a group".into(),
@@ -189,6 +273,23 @@ pub fn show(ctx: &egui::Context, form: &mut Form, store: &Store) -> Outcome {
         ui.add_space(12.0);
 
         match form {
+            Form::CreateUser { fields } => {
+                create_user(ui, store, fields, &mut outcome);
+            }
+            Form::AutomaticReplies {
+                id,
+                name,
+                on,
+                internal,
+                external,
+                audience,
+                same_message,
+            } => {
+                automatic_replies(
+                    ui, id, name, on, internal, external, audience, same_message,
+                    &mut outcome,
+                );
+            }
             Form::EditUser { id, name, fields } => {
                 edit_user(ui, id, name, fields, &mut outcome);
             }
@@ -375,6 +476,291 @@ fn edit_user(
                 patch,
             }))
         };
+    }
+}
+
+/// Characters Entra accepts in the alias part of a sign-in name.
+///
+/// Deliberately checked here rather than left to Graph: the rejection comes
+/// back as a generic `Request_BadRequest` that names neither the property nor
+/// the offending character, which is a miserable thing to debug from a dialog.
+fn alias_is_valid(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "'.-_!#^~".contains(c))
+}
+
+fn create_user(
+    ui: &mut egui::Ui,
+    store: &Store,
+    fields: &mut NewUserFields,
+    outcome: &mut Outcome,
+) {
+    let previous = fields.display_name.clone();
+    field(ui, "Name", &mut fields.display_name);
+
+    // The alias tracks the name until the operator types one themselves, at
+    // which point it stops moving under them.
+    if !fields.alias_edited && fields.alias == derive_nickname(&previous) {
+        fields.alias = derive_nickname(&fields.display_name);
+    }
+
+    // Sign-in name, as alias + domain. Split because the domain must be one the
+    // tenant has verified — Graph rejects anything else, and picking from a list
+    // is both faster and impossible to get wrong.
+    let domains: Vec<String> = store
+        .org
+        .as_ref()
+        .map(|org| {
+            org.verified_domains
+                .iter()
+                .filter_map(|domain| domain.name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if fields.domain.is_empty() {
+        fields.domain = store
+            .org
+            .as_ref()
+            .map(|org| org.default_domain())
+            .filter(|domain| domain != "—")
+            .unwrap_or_default();
+    }
+
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(130.0, 0.0),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                ui.label(RichText::new("Sign-in name").color(theme::MUTED));
+            },
+        );
+        let alias = ui.add(
+            egui::TextEdit::singleline(&mut fields.alias)
+                .desired_width(150.0)
+                .hint_text("alias"),
+        );
+        if alias.changed() {
+            fields.alias_edited = true;
+        }
+        ui.label("@");
+        if domains.is_empty() {
+            // No tenant details yet, so there is no list to choose from.
+            ui.add(
+                egui::TextEdit::singleline(&mut fields.domain)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("contoso.com"),
+            );
+        } else {
+            egui::ComboBox::from_id_salt("new-user-domain")
+                .selected_text(if fields.domain.is_empty() {
+                    "Choose a domain"
+                } else {
+                    fields.domain.as_str()
+                })
+                .show_ui(ui, |ui| {
+                    for domain in &domains {
+                        ui.selectable_value(&mut fields.domain, domain.clone(), domain);
+                    }
+                });
+        }
+    });
+    ui.add_space(4.0);
+
+    field(ui, "Job title", &mut fields.job_title);
+    field(ui, "Department", &mut fields.department);
+    field(ui, "Usage location", &mut fields.usage_location);
+
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(130.0, 0.0),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                ui.label(RichText::new("Account").color(theme::MUTED));
+            },
+        );
+        ui.checkbox(&mut fields.account_enabled, "Can sign in immediately");
+    });
+
+    ui.add_space(10.0);
+    ui.label(RichText::new("TEMPORARY PASSWORD").small().color(theme::MUTED));
+    ui.add_space(4.0);
+
+    if fields.password.is_empty() {
+        ui.label(
+            RichText::new(
+                "Could not generate a password: the system random source is \
+                 unavailable. Use the Entra portal instead.",
+            )
+            .color(theme::BAD),
+        );
+        close_button(ui, outcome);
+        return;
+    }
+
+    // Selectable and monospaced, for the same reason as a password reset: this
+    // gets read aloud or pasted into a message.
+    egui::Frame::group(ui.style())
+        .fill(ui.visuals().extreme_bg_color)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(fields.password.as_str()).monospace().size(15.0));
+        });
+
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if ui.button("Copy").clicked() {
+            ui.ctx().copy_text(fields.password.clone());
+        }
+        if ui.button("Generate another").clicked() {
+            fields.password = generate_password();
+        }
+    });
+
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new(
+            "The account must change this at first sign-in. Copy it now — gcm does \
+             not store it, and it cannot be shown again once this dialog closes.",
+        )
+        .small()
+        .color(theme::WARN),
+    );
+
+    let alias = fields.alias.trim();
+    let domain = fields.domain.trim();
+    let location = fields.usage_location.trim();
+    let valid = !fields.display_name.trim().is_empty()
+        && alias_is_valid(alias)
+        && !domain.is_empty()
+        // Two letters or nothing; a half-typed country code would be rejected
+        // by Graph after the fact.
+        && (location.is_empty() || location.len() == 2);
+
+    if !valid && !fields.alias.trim().is_empty() && !alias_is_valid(alias) {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(
+                "A sign-in name may contain only letters, digits and ' . - _ ! # ^ ~",
+            )
+            .small()
+            .color(theme::BAD),
+        );
+    }
+
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(
+            "Usage location is a two-letter country code. Leaving it blank is fine, \
+             but a licence cannot be assigned until it is set.",
+        )
+        .small()
+        .color(theme::MUTED),
+    );
+
+    if buttons(ui, "Create", valid, outcome) {
+        let optional = |value: &str| {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        };
+        *outcome = Outcome::Submit(Box::new(Action::CreateUser {
+            spec: Box::new(UserSpec {
+                display_name: fields.display_name.trim().to_string(),
+                user_principal_name: format!("{alias}@{domain}"),
+                mail_nickname: alias.to_string(),
+                password: fields.password.clone(),
+                account_enabled: fields.account_enabled,
+                job_title: optional(&fields.job_title),
+                department: optional(&fields.department),
+                usage_location: optional(location).map(|code| code.to_uppercase()),
+            }),
+        }));
+    }
+}
+
+#[expect(clippy::too_many_arguments, reason = "a form needs its whole state")]
+fn automatic_replies(
+    ui: &mut egui::Ui,
+    id: &str,
+    name: &str,
+    on: &mut bool,
+    internal: &mut String,
+    external: &mut String,
+    audience: &mut String,
+    same_message: &mut bool,
+    outcome: &mut Outcome,
+) {
+    ui.checkbox(on, "Send automatic replies");
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(
+            "Replies are sent until they are switched off again. Scheduling a start \
+             and end is only available in Outlook.",
+        )
+        .small()
+        .color(theme::MUTED),
+    );
+    ui.add_space(10.0);
+
+    // The whole form below is inert while replies are off, rather than hidden,
+    // so the dialog does not change height as the tick box is toggled.
+    ui.add_enabled_ui(*on, |ui| {
+        ui.label(RichText::new("Reply to colleagues").color(theme::MUTED));
+        ui.add(
+            egui::TextEdit::multiline(internal)
+                .desired_width(f32::INFINITY)
+                .desired_rows(3),
+        );
+        if *same_message {
+            external.clone_from(internal);
+        }
+
+        ui.add_space(8.0);
+        ui.checkbox(same_message, "Send the same reply outside the organisation");
+        ui.add_space(8.0);
+
+        ui.label(RichText::new("Reply to people outside").color(theme::MUTED));
+        ui.add_enabled(
+            !*same_message,
+            egui::TextEdit::multiline(external)
+                .desired_width(f32::INFINITY)
+                .desired_rows(3),
+        );
+
+        ui.add_space(10.0);
+        ui.label(RichText::new("Send the external reply to").color(theme::MUTED));
+        ui.horizontal(|ui| {
+            for (value, label) in [
+                ("all", "Everyone"),
+                ("contactsOnly", "Contacts only"),
+                ("none", "Nobody"),
+            ] {
+                ui.radio_value(audience, value.to_string(), label);
+            }
+        });
+    });
+
+    // A reply that says nothing is worse than none: the sender learns only that
+    // the mailbox is automated.
+    let valid = !*on || !internal.trim().is_empty();
+    if buttons(ui, "Save", valid, outcome) {
+        *outcome = Outcome::Submit(Box::new(Action::SetAutomaticReplies {
+            id: id.to_string(),
+            name: name.to_string(),
+            spec: Box::new(AutoReplySpec {
+                enabled: *on,
+                internal_message: internal.trim().to_string(),
+                external_message: if *same_message {
+                    internal.trim().to_string()
+                } else {
+                    external.trim().to_string()
+                },
+                external_audience: audience.clone(),
+            }),
+        }));
     }
 }
 
@@ -925,6 +1311,97 @@ mod tests {
             }
             .is_empty()
         );
+    }
+
+    #[test]
+    fn sign_in_names_accept_what_entra_accepts() {
+        assert!(alias_is_valid("nadia.ferrero"));
+        assert!(alias_is_valid("o'brien"));
+        assert!(alias_is_valid("a_b-c!d#e^f~g"));
+        assert!(alias_is_valid("svc01"));
+    }
+
+    #[test]
+    fn sign_in_names_reject_what_entra_rejects() {
+        // Checked here so the operator is told which character is wrong,
+        // rather than getting Graph's generic Request_BadRequest back.
+        assert!(!alias_is_valid(""));
+        assert!(!alias_is_valid("has space"));
+        assert!(!alias_is_valid("has@at"));
+        assert!(!alias_is_valid("accented-é"));
+        assert!(!alias_is_valid("comma,name"));
+    }
+
+    #[test]
+    fn a_new_user_form_starts_ready_to_submit() {
+        let Form::CreateUser { fields } = Form::create_user() else {
+            panic!("create_user must produce a CreateUser form");
+        };
+        // A generated password up front is the point: the operator should never
+        // have to think of one, and an empty field would invite a weak choice.
+        assert_eq!(fields.password.chars().count(), PASSWORD_LENGTH);
+        assert!(fields.account_enabled);
+        assert!(!fields.alias_edited);
+    }
+
+    #[test]
+    fn automatic_replies_open_showing_what_is_already_set() {
+        // Opening the form and saving without typing must change nothing, so
+        // every field has to be seeded from the mailbox as it stands.
+        let current = crate::graph::models::AutomaticReplies {
+            status: Some("alwaysEnabled".into()),
+            external_audience: Some("contactsOnly".into()),
+            internal_reply_message: Some("<p>On leave.</p>".into()),
+            external_reply_message: Some("<p>Away.</p>".into()),
+            ..Default::default()
+        };
+        let form = Form::automatic_replies("id".into(), "Elena Marsh".into(), Some(current));
+        let Form::AutomaticReplies {
+            on,
+            internal,
+            external,
+            audience,
+            same_message,
+            ..
+        } = form
+        else {
+            panic!("must produce an AutomaticReplies form");
+        };
+        assert!(on);
+        assert_eq!(internal, "On leave.");
+        assert_eq!(external, "Away.");
+        assert_eq!(audience, "contactsOnly");
+        // The two messages differ, so they must not be linked together.
+        assert!(!same_message);
+    }
+
+    #[test]
+    fn matching_replies_open_with_the_messages_linked() {
+        let current = crate::graph::models::AutomaticReplies {
+            status: Some("alwaysEnabled".into()),
+            internal_reply_message: Some("<p>Back Monday.</p>".into()),
+            external_reply_message: Some("<p>Back Monday.</p>".into()),
+            ..Default::default()
+        };
+        let form = Form::automatic_replies("id".into(), "Elena".into(), Some(current));
+        let Form::AutomaticReplies { same_message, .. } = form else {
+            panic!("must produce an AutomaticReplies form");
+        };
+        assert!(same_message);
+    }
+
+    #[test]
+    fn a_mailbox_with_no_replies_set_opens_switched_off() {
+        let form = Form::automatic_replies("id".into(), "Ben".into(), None);
+        let Form::AutomaticReplies {
+            on, same_message, ..
+        } = form
+        else {
+            panic!("must produce an AutomaticReplies form");
+        };
+        assert!(!on);
+        // Two empty messages are trivially the same, so they start linked.
+        assert!(same_message);
     }
 
     #[test]

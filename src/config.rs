@@ -46,6 +46,19 @@ pub const READ_SCOPES: &[&str] = &[
     "Device.Read.All",
     "DeviceManagementManagedDevices.Read.All",
     "Organization.Read.All",
+    // Sign-in and directory audit logs. The sign-in log additionally needs
+    // Entra ID P1 on the tenant and a reporting role on the signed-in account,
+    // neither of which a scope can supply — hence the graceful degradation.
+    "AuditLog.Read.All",
+    // Teams. Team.ReadBasic.All lists them; TeamSettings.Read.All is what
+    // fills in the settings and archived state on an individual team.
+    "Team.ReadBasic.All",
+    "TeamSettings.Read.All",
+    "Channel.ReadBasic.All",
+    // The mailbox usage report, which is the only way Graph will enumerate
+    // mailboxes at all.
+    "Reports.Read.All",
+    "MailboxSettings.Read",
 ];
 
 /// Additional scopes needed to change the tenant, requested on top of
@@ -64,6 +77,10 @@ pub const WRITE_SCOPES: &[&str] = &[
     "DeviceManagementManagedDevices.PrivilegedOperations.All",
     // Administrative password reset.
     "UserAuthenticationMethod.ReadWrite.All",
+    // Archiving and unarchiving a team.
+    "TeamSettings.ReadWrite.All",
+    // Setting somebody's automatic replies.
+    "MailboxSettings.ReadWrite",
 ];
 
 /// The scope string to request, with or without the write permissions.
@@ -104,10 +121,32 @@ pub struct Query {
     /// paint fast in very large tenants. 0 means no limit.
     #[serde(default)]
     pub max_objects: u32,
+    /// How far back the sign-in and audit log views reach, in days.
+    ///
+    /// Separate from `max_objects` because the logs need a bound that the
+    /// directory collections do not: an unfiltered call to the sign-in log
+    /// times out on a busy tenant, and "no limit" is not an option there.
+    #[serde(default = "default_log_days")]
+    pub log_days: u32,
+    /// Most log entries to hold, across all pages.
+    #[serde(default = "default_log_records")]
+    pub log_records: u32,
 }
 
 fn default_page_size() -> u32 {
     999
+}
+
+/// A week: long enough to cover "what happened over the weekend", short enough
+/// that the query returns promptly.
+fn default_log_days() -> u32 {
+    7
+}
+
+/// Enough to scan for something unusual without holding a busy tenant's entire
+/// week of sign-ins in memory.
+fn default_log_records() -> u32 {
+    500
 }
 
 impl Default for Query {
@@ -115,6 +154,8 @@ impl Default for Query {
         Self {
             page_size: default_page_size(),
             max_objects: 0,
+            log_days: default_log_days(),
+            log_records: default_log_records(),
         }
     }
 }
@@ -174,6 +215,23 @@ impl Config {
         self.query.page_size.clamp(1, 999)
     }
 
+    /// How far back the log views reach. Entra keeps at most 30 days of
+    /// sign-ins without a P2 licence, so asking for more just returns less.
+    pub fn log_days(&self) -> u32 {
+        self.query.log_days.clamp(1, 30)
+    }
+
+    /// Ceiling on log entries held in memory.
+    pub fn log_records(&self) -> usize {
+        self.query.log_records.max(1) as usize
+    }
+
+    /// Page size for the log endpoints, which cap at 1000 rather than 999 and
+    /// should never ask for more than the ceiling will keep.
+    pub fn log_page_size(&self) -> u32 {
+        self.query.log_records.clamp(1, 1000)
+    }
+
     fn validate(&self) -> Result<()> {
         let path = config_path();
         if is_placeholder(&self.application.client) {
@@ -213,7 +271,11 @@ const TEMPLATE: &str = r#"; Graphical Cloud Manager (gcm)
 ; flows", and grant these delegated Microsoft Graph permissions:
 ;   User.Read.All, Group.Read.All, GroupMember.Read.All, Directory.Read.All,
 ;   RoleManagement.Read.Directory, Device.Read.All, Organization.Read.All,
-;   DeviceManagementManagedDevices.Read.All
+;   DeviceManagementManagedDevices.Read.All, AuditLog.Read.All,
+;   Team.ReadBasic.All, TeamSettings.Read.All, Channel.ReadBasic.All,
+;   Reports.Read.All, MailboxSettings.Read
+;
+; Anything not granted simply shows as unavailable in that view; gcm still runs.
 ;
 ; Then fill in the two IDs below and restart gcm.
 
@@ -223,9 +285,15 @@ tenant = "TENANT_ID_HERE"
 
 ; Objects fetched per Graph request (max 999), and a safety valve for very large
 ; tenants. max_objects = 0 means fetch everything.
+;
+; The sign-in and audit log views get their own limits: they are far larger than
+; any directory collection, so "everything" is never the right answer there.
+; Entra keeps at most 30 days of sign-ins without an Entra ID P2 licence.
 [query]
 page_size = 999
 max_objects = 0
+log_days = 7
+log_records = 500
 
 ; Sovereign clouds only — omit this section for worldwide commercial M365.
 ; [cloud]
@@ -351,6 +419,66 @@ page_size = 5000
 "#;
         let config: Config = parse(raw).expect("should parse");
         assert_eq!(config.page_size(), 999);
+    }
+
+    #[test]
+    fn log_limits_have_workable_defaults() {
+        let raw = "[application]\nclient = \"abc\"\ntenant = \"def\"\n";
+        let config: Config = parse(raw).expect("should parse");
+        assert_eq!(config.log_days(), 7);
+        assert_eq!(config.log_records(), 500);
+        assert_eq!(config.log_page_size(), 500);
+    }
+
+    #[test]
+    fn clamps_log_limits_to_what_graph_allows() {
+        let raw = r#"
+[application]
+client = "abc"
+tenant = "def"
+
+[query]
+log_days = 400
+log_records = 100000
+"#;
+        let config: Config = parse(raw).expect("should parse");
+        // Entra keeps 30 days at most, and the log endpoints cap a page at 1000.
+        assert_eq!(config.log_days(), 30);
+        assert_eq!(config.log_page_size(), 1000);
+        // The overall ceiling is ours to honour, so it is not clamped down.
+        assert_eq!(config.log_records(), 100_000);
+    }
+
+    #[test]
+    fn a_zero_log_limit_never_asks_for_zero_records() {
+        let raw = r#"
+[application]
+client = "abc"
+tenant = "def"
+
+[query]
+log_days = 0
+log_records = 0
+"#;
+        let config: Config = parse(raw).expect("should parse");
+        assert_eq!(config.log_days(), 1);
+        assert_eq!(config.log_records(), 1);
+        assert_eq!(config.log_page_size(), 1);
+    }
+
+    #[test]
+    fn every_write_scope_is_additional_to_the_read_set() {
+        // The two lists are concatenated at sign-in; a duplicate would make the
+        // consent prompt list the same permission twice.
+        for scope in WRITE_SCOPES {
+            assert!(
+                !READ_SCOPES.contains(scope),
+                "{scope} appears in both scope lists"
+            );
+        }
+        assert!(scopes(false).split(' ').count() == READ_SCOPES.len());
+        assert!(scopes(true).contains("User.ReadWrite.All"));
+        assert!(!scopes(false).contains("ReadWrite"));
     }
 
     #[test]

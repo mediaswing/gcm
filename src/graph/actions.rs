@@ -101,6 +101,86 @@ impl DeviceOp {
     }
 }
 
+/// What to do to a team.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeamOp {
+    /// Makes the team read-only in the Teams client without removing anything.
+    Archive,
+    Unarchive,
+    /// Deletes the team by deleting the Microsoft 365 group behind it, which is
+    /// the only way Graph offers.
+    Delete,
+}
+
+impl TeamOp {
+    fn verb(self) -> &'static str {
+        match self {
+            TeamOp::Archive => "Archive",
+            TeamOp::Unarchive => "Restore",
+            TeamOp::Delete => "Delete",
+        }
+    }
+
+    fn severity(self) -> Severity {
+        match self {
+            // Unarchiving simply undoes an archive, so it needs no ceremony.
+            TeamOp::Unarchive => Severity::Safe,
+            TeamOp::Archive => Severity::Caution,
+            TeamOp::Delete => Severity::Destructive,
+        }
+    }
+
+    fn consequence(self) -> Option<&'static str> {
+        match self {
+            TeamOp::Archive => Some(
+                "The team becomes read-only: nobody can post, and its channels and \
+                 files stay where they are. It can be restored at any time.",
+            ),
+            TeamOp::Delete => Some(
+                "A team is deleted by deleting the Microsoft 365 group behind it, so \
+                 this also removes the group, its mailbox, its SharePoint site and \
+                 every channel conversation. It can be restored for 30 days.",
+            ),
+            TeamOp::Unarchive => None,
+        }
+    }
+}
+
+/// A new user to create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserSpec {
+    pub display_name: String,
+    pub user_principal_name: String,
+    pub mail_nickname: String,
+    pub password: String,
+    /// Whether the account can sign in the moment it exists. Off is a
+    /// legitimate choice for an account prepared ahead of a start date.
+    pub account_enabled: bool,
+    pub job_title: Option<String>,
+    pub department: Option<String>,
+    /// Two-letter country code. Graph refuses to assign a licence without one,
+    /// so the form asks for it up front rather than letting the first licence
+    /// assignment fail confusingly.
+    pub usage_location: Option<String>,
+}
+
+/// How somebody's automatic replies should be set.
+///
+/// Scheduled replies are deliberately not modelled: they need a start and end
+/// instant in the mailbox's own time zone, and a console that got that subtly
+/// wrong would silently stop answering somebody's mail on the wrong day.
+/// Turning replies on and off covers what an administrator is asked to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoReplySpec {
+    pub enabled: bool,
+    /// Reply sent to colleagues.
+    pub internal_message: String,
+    /// Reply sent outside the organisation, when `external_audience` allows it.
+    pub external_message: String,
+    /// `none`, `contactsOnly` or `all`.
+    pub external_audience: String,
+}
+
 /// Which membership list an object is being added to or removed from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemberRole {
@@ -198,6 +278,9 @@ pub struct GroupSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
+    CreateUser {
+        spec: Box<UserSpec>,
+    },
     SetUserEnabled {
         id: String,
         name: String,
@@ -259,6 +342,18 @@ pub enum Action {
         name: String,
         op: DeviceOp,
     },
+    Team {
+        /// The team's id, which is also its backing group's id.
+        id: String,
+        name: String,
+        op: TeamOp,
+    },
+    SetAutomaticReplies {
+        /// The mailbox owner's object id.
+        id: String,
+        name: String,
+        spec: Box<AutoReplySpec>,
+    },
 }
 
 impl Action {
@@ -266,6 +361,10 @@ impl Action {
     /// and the audit log.
     pub fn label(&self) -> String {
         match self {
+            Action::CreateUser { spec } => format!(
+                "Create the user {} ({})",
+                spec.display_name, spec.user_principal_name
+            ),
             Action::SetUserEnabled { name, enabled, .. } => {
                 let verb = if *enabled { "Enable" } else { "Disable" };
                 format!("{verb} {name}")
@@ -310,6 +409,14 @@ impl Action {
             }
             Action::DeleteDevice { name, .. } => format!("Delete the device {name}"),
             Action::ManagedDevice { name, op, .. } => format!("{} {name}", op.verb()),
+            Action::Team { name, op, .. } => format!("{} the team {name}", op.verb()),
+            Action::SetAutomaticReplies { name, spec, .. } => {
+                if spec.enabled {
+                    format!("Turn on automatic replies for {name}")
+                } else {
+                    format!("Turn off automatic replies for {name}")
+                }
+            }
         }
     }
 
@@ -326,10 +433,18 @@ impl Action {
                 if *assign { "ASSIGN" } else { "UNASSIGN" }
             }
             Action::SetMembership { add, .. } => if *add { "ADD" } else { "REMOVE" },
-            Action::CreateGroup { .. } => "CREATE",
+            Action::CreateGroup { .. } | Action::CreateUser { .. } => "CREATE",
+            Action::SetAutomaticReplies { spec, .. } => {
+                if spec.enabled { "ENABLE" } else { "DISABLE" }
+            }
             Action::DeleteUser { .. }
             | Action::DeleteGroup { .. }
             | Action::DeleteDevice { .. } => "DELETE",
+            Action::Team { op, .. } => match op {
+                TeamOp::Archive => "ARCHIVE",
+                TeamOp::Unarchive => "RESTORE",
+                TeamOp::Delete => "DELETE",
+            },
             Action::ManagedDevice { op, .. } => match op {
                 DeviceOp::Sync => "SYNC",
                 DeviceOp::Restart => "RESTART",
@@ -350,16 +465,24 @@ impl Action {
     pub fn severity(&self) -> Severity {
         match self {
             Action::ManagedDevice { op, .. } => op.severity(),
+            Action::Team { op, .. } => op.severity(),
 
             Action::DeleteUser { .. }
             | Action::DeleteGroup { .. }
             | Action::DeleteDevice { .. } => Severity::Destructive,
 
-            Action::SetUserEnabled { .. }
+            // Creating a user is not destructive, but it does mint a sign-in
+            // identity with a password — more than enough to be worth a look
+            // before it happens, unlike creating an empty group.
+            Action::CreateUser { .. }
+            | Action::SetUserEnabled { .. }
             | Action::ResetPassword { .. }
             | Action::SetLicense { .. }
             | Action::SetMembership { .. }
-            | Action::SetDeviceEnabled { .. } => Severity::Caution,
+            | Action::SetDeviceEnabled { .. }
+            // Answering somebody's mail on their behalf is visible to everyone
+            // who writes to them, so it is not a quiet change.
+            | Action::SetAutomaticReplies { .. } => Severity::Caution,
 
             Action::UpdateUser { .. }
             | Action::UpdateGroup { .. }
@@ -379,6 +502,16 @@ impl Action {
     pub fn consequence(&self) -> Option<&'static str> {
         match self {
             Action::ManagedDevice { op, .. } => op.consequence(),
+            Action::Team { op, .. } => op.consequence(),
+            Action::CreateUser { .. } => Some(
+                "The account can sign in as soon as it exists, using the password \
+                 shown on the previous screen. Copy that password now — it is not \
+                 stored and cannot be shown again.",
+            ),
+            Action::SetAutomaticReplies { spec, .. } if spec.enabled => Some(
+                "Everyone who writes to this mailbox gets the reply below, until \
+                 automatic replies are turned off again.",
+            ),
             Action::DeleteUser { .. } => Some(
                 "The account is moved to the deleted items container, where it can be \
                  restored for 30 days before being purged permanently.",
@@ -407,8 +540,11 @@ impl Action {
             | Action::DeleteGroup { name, .. }
             | Action::SetDeviceEnabled { name, .. }
             | Action::DeleteDevice { name, .. }
-            | Action::ManagedDevice { name, .. } => name,
+            | Action::ManagedDevice { name, .. }
+            | Action::Team { name, .. }
+            | Action::SetAutomaticReplies { name, .. } => name,
             Action::CreateGroup { spec } => &spec.display_name,
+            Action::CreateUser { spec } => &spec.display_name,
             Action::SetMembership { member_name, .. } => member_name,
         }
     }
@@ -425,8 +561,12 @@ impl Action {
             | Action::DeleteGroup { id, .. }
             | Action::SetDeviceEnabled { id, .. }
             | Action::DeleteDevice { id, .. }
-            | Action::ManagedDevice { id, .. } => id,
-            Action::CreateGroup { .. } => "",
+            | Action::ManagedDevice { id, .. }
+            | Action::Team { id, .. }
+            | Action::SetAutomaticReplies { id, .. } => id,
+            // The object does not exist yet, so there is no id to record. The
+            // audit line still names it, which is what makes it findable.
+            Action::CreateGroup { .. } | Action::CreateUser { .. } => "",
             Action::SetMembership { group_id, .. } => group_id,
         }
     }
@@ -434,7 +574,8 @@ impl Action {
     /// Which collection to reload once this action succeeds.
     pub fn collection(&self) -> Collection {
         match self {
-            Action::SetUserEnabled { .. }
+            Action::CreateUser { .. }
+            | Action::SetUserEnabled { .. }
             | Action::ResetPassword { .. }
             | Action::UpdateUser { .. }
             | Action::SetLicense { .. }
@@ -449,6 +590,11 @@ impl Action {
                 Collection::Devices
             }
             Action::ManagedDevice { .. } => Collection::ManagedDevices,
+            Action::Team { .. } => Collection::Teams,
+            // The mailbox list comes from a usage report that lags by a day, so
+            // it would not show this change however hard it were refreshed. The
+            // settings themselves are re-read on selection instead.
+            Action::SetAutomaticReplies { .. } => Collection::Mailboxes,
         }
     }
 
@@ -460,6 +606,32 @@ impl Action {
         let encode = urlencoding::encode;
 
         match self {
+            Action::CreateUser { spec } => {
+                let mut body = json!({
+                    "accountEnabled": spec.account_enabled,
+                    "displayName": spec.display_name,
+                    "mailNickname": spec.mail_nickname,
+                    "userPrincipalName": spec.user_principal_name,
+                    "passwordProfile": {
+                        "password": spec.password,
+                        "forceChangePasswordNextSignIn": true
+                    }
+                });
+                // Optional properties are omitted rather than sent empty: a
+                // blank string would set the field to blank, which for a brand
+                // new account is not the same as leaving it unset.
+                for (key, value) in [
+                    ("jobTitle", &spec.job_title),
+                    ("department", &spec.department),
+                    ("usageLocation", &spec.usage_location),
+                ] {
+                    if let Some(value) = value {
+                        body[key] = json!(value);
+                    }
+                }
+                client.write(Method::POST, "/users", Some(body)).await
+            }
+
             Action::SetUserEnabled { id, enabled, .. } => {
                 client
                     .write(
@@ -666,6 +838,61 @@ impl Action {
                     DeviceOp::Delete => client.write(Method::DELETE, &base, None).await,
                 }
             }
+
+            Action::Team { id, op, .. } => match op {
+                TeamOp::Archive => {
+                    client
+                        .write(
+                            Method::POST,
+                            &format!("/teams/{}/archive", encode(id)),
+                            // Leaving the SharePoint site writable would let
+                            // members keep changing files in a team they can no
+                            // longer post in, which is not what "archived" means
+                            // to anyone reading the word.
+                            Some(json!({ "shouldSetSpoSiteReadOnlyForMembers": true })),
+                        )
+                        .await
+                }
+                TeamOp::Unarchive => {
+                    client
+                        .write(
+                            Method::POST,
+                            &format!("/teams/{}/unarchive", encode(id)),
+                            None,
+                        )
+                        .await
+                }
+                // Graph has no endpoint that deletes a team; a team is deleted
+                // by deleting the Microsoft 365 group it is built on, whose id
+                // is the same as the team's.
+                TeamOp::Delete => {
+                    client
+                        .write(Method::DELETE, &format!("/groups/{}", encode(id)), None)
+                        .await
+                }
+            },
+
+            Action::SetAutomaticReplies { id, spec, .. } => {
+                let setting = if spec.enabled {
+                    json!({
+                        "status": "alwaysEnabled",
+                        "externalAudience": spec.external_audience,
+                        "internalReplyMessage": spec.internal_message,
+                        "externalReplyMessage": spec.external_message,
+                    })
+                } else {
+                    // Only the status is sent when switching off, so the message
+                    // somebody wrote survives to be turned back on unchanged.
+                    json!({ "status": "disabled" })
+                };
+                client
+                    .write(
+                        Method::PATCH,
+                        &format!("/users/{}/mailboxSettings", encode(id)),
+                        Some(json!({ "automaticRepliesSetting": setting })),
+                    )
+                    .await
+            }
         }
     }
 }
@@ -821,6 +1048,91 @@ mod tests {
         assert!(json.get("department").is_none());
         assert!(!patch.is_empty());
         assert!(UserPatch::default().is_empty());
+    }
+
+    fn new_user() -> Action {
+        Action::CreateUser {
+            spec: Box::new(UserSpec {
+                display_name: "Nadia Ferrero".into(),
+                user_principal_name: "nadia.ferrero@contoso.co.uk".into(),
+                mail_nickname: "nadia.ferrero".into(),
+                password: "correct-horse".into(),
+                account_enabled: true,
+                job_title: None,
+                department: None,
+                usage_location: Some("GB".into()),
+            }),
+        }
+    }
+
+    #[test]
+    fn creating_a_user_is_confirmed_but_not_typed() {
+        // It mints a sign-in identity, so it warrants a look; it destroys
+        // nothing, so demanding a typed name would be theatre.
+        assert_eq!(new_user().severity(), Severity::Caution);
+        assert_eq!(new_user().confirm_phrase(), None);
+        assert!(new_user().consequence().is_some());
+        assert_eq!(
+            new_user().label(),
+            "Create the user Nadia Ferrero (nadia.ferrero@contoso.co.uk)"
+        );
+        assert_eq!(new_user().collection(), Collection::Users);
+    }
+
+    #[test]
+    fn deleting_a_team_is_destructive_and_archiving_is_not() {
+        let team = |op| Action::Team {
+            id: "team-1".into(),
+            name: "Project Falcon".into(),
+            op,
+        };
+        assert_eq!(team(TeamOp::Delete).severity(), Severity::Destructive);
+        assert_eq!(
+            team(TeamOp::Delete).confirm_phrase().as_deref(),
+            Some("Project Falcon")
+        );
+        assert_eq!(team(TeamOp::Archive).severity(), Severity::Caution);
+        // Undoing an archive cannot lose anything, so it runs without a prompt.
+        assert_eq!(team(TeamOp::Unarchive).severity(), Severity::Safe);
+        assert_eq!(team(TeamOp::Unarchive).confirm_phrase(), None);
+
+        // Deleting a team removes the group behind it; the modal must say so.
+        assert!(
+            team(TeamOp::Delete)
+                .consequence()
+                .is_some_and(|text| text.contains("Microsoft 365 group"))
+        );
+        assert_eq!(team(TeamOp::Archive).collection(), Collection::Teams);
+    }
+
+    #[test]
+    fn automatic_replies_read_as_on_or_off() {
+        let replies = |enabled| Action::SetAutomaticReplies {
+            id: "user-1".into(),
+            name: "Elena Marsh".into(),
+            spec: Box::new(AutoReplySpec {
+                enabled,
+                internal_message: "On leave.".into(),
+                external_message: "On leave.".into(),
+                external_audience: "all".into(),
+            }),
+        };
+        assert_eq!(
+            replies(true).label(),
+            "Turn on automatic replies for Elena Marsh"
+        );
+        assert_eq!(replies(false).verb(), "DISABLE");
+        assert_eq!(replies(true).severity(), Severity::Caution);
+        // Switching replies off tells nobody anything, so it needs no warning.
+        assert!(replies(true).consequence().is_some());
+        assert!(replies(false).consequence().is_none());
+    }
+
+    #[test]
+    fn creating_an_object_records_no_target_id() {
+        // Nothing exists yet to have an id; the label carries the name instead.
+        assert_eq!(new_user().target_id(), "");
+        assert_eq!(new_user().target_name(), "Nadia Ferrero");
     }
 
     #[test]

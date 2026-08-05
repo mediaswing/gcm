@@ -12,6 +12,7 @@
 
 pub mod actions;
 pub mod models;
+pub mod reports;
 pub mod skus;
 
 use std::time::Duration;
@@ -122,8 +123,23 @@ impl GraphClient {
 
     /// GET every page of a collection, honouring the configured ceiling.
     async fn get_all<T: DeserializeOwned>(&mut self, path_and_query: &str) -> Result<Vec<T>> {
-        let mut url = format!("{}{}", self.config.graph_url(), path_and_query);
         let ceiling = self.config.query.max_objects as usize;
+        self.get_paged(path_and_query, ceiling).await
+    }
+
+    /// GET pages of a collection until `ceiling` objects have been collected.
+    ///
+    /// The ceiling is a separate parameter rather than always coming from the
+    /// configuration because the log collections need one that the directory
+    /// collections do not: `max_objects` defaults to unlimited, which is the
+    /// right answer for a few thousand users and a catastrophic one for a
+    /// sign-in log that grows by six figures a day.
+    async fn get_paged<T: DeserializeOwned>(
+        &mut self,
+        path_and_query: &str,
+        ceiling: usize,
+    ) -> Result<Vec<T>> {
+        let mut url = format!("{}{}", self.config.graph_url(), path_and_query);
         let mut collected: Vec<T> = Vec::new();
 
         loop {
@@ -236,17 +252,44 @@ impl GraphClient {
         path_and_query: &str,
         unavailable_hint: &str,
     ) -> Result<Fetch<Vec<T>>> {
-        match self.get_all::<T>(path_and_query).await {
-            Ok(items) => Ok(Fetch::Ready(items)),
-            Err(err) => {
-                let text = err.to_string();
-                if is_feature_unavailable(&text) {
-                    Ok(Fetch::Unavailable(format!("{unavailable_hint}\n\n{text}")))
-                } else {
-                    Err(err)
-                }
-            }
-        }
+        let ceiling = self.config.query.max_objects as usize;
+        self.get_paged_optional(path_and_query, ceiling, unavailable_hint)
+            .await
+    }
+
+    /// As [`Self::get_all_optional`], with an explicit ceiling for collections
+    /// that must not be walked to the end.
+    async fn get_paged_optional<T: DeserializeOwned>(
+        &mut self,
+        path_and_query: &str,
+        ceiling: usize,
+        unavailable_hint: &str,
+    ) -> Result<Fetch<Vec<T>>> {
+        let result = self.get_paged::<T>(path_and_query, ceiling).await;
+        optional(result, unavailable_hint)
+    }
+
+    /// The single-resource counterpart, for the details a tenant may not
+    /// expose — team settings, another user's mailbox.
+    async fn get_one_optional<T: DeserializeOwned>(
+        &mut self,
+        path_and_query: &str,
+        unavailable_hint: &str,
+    ) -> Result<Fetch<T>> {
+        let result = self.get_one::<T>(path_and_query).await;
+        optional(result, unavailable_hint)
+    }
+
+    /// GET one of the Microsoft 365 usage reports as text.
+    ///
+    /// These answer `302` with a short-lived, pre-authenticated download URL
+    /// rather than returning the body directly. reqwest follows the redirect
+    /// for us and strips the `Authorization` header on the way, which is both
+    /// correct and necessary — the download host neither wants nor should see
+    /// a Graph bearer token.
+    async fn get_report(&mut self, path_and_query: &str) -> Result<String> {
+        let url = format!("{}{}", self.config.graph_url(), path_and_query);
+        self.get_raw(&url).await
     }
 
     // ---- Tenant -----------------------------------------------------------
@@ -396,6 +439,177 @@ impl GraphClient {
         });
         Ok(skus)
     }
+
+    // ---- Sign-in and audit logs -------------------------------------------
+
+    /// Recent sign-ins, newest first.
+    ///
+    /// Two limits are deliberate. The window comes from the configuration and
+    /// is applied as a `$filter`, because Microsoft's own guidance is that an
+    /// unfiltered call to this endpoint times out on a busy tenant. The record
+    /// ceiling is applied on top, because even a single day of sign-ins can run
+    /// to six figures and this console holds everything in memory.
+    pub async fn sign_ins(&mut self) -> Result<Fetch<Vec<SignIn>>> {
+        let since = (chrono::Utc::now()
+            - chrono::Duration::days(self.config.log_days() as i64))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+        let filter = urlencoding::encode(&format!("createdDateTime ge {since}")).into_owned();
+
+        let hint = "This tenant does not expose the sign-in log. It needs Microsoft \
+                    Entra ID P1 or P2, the app registration needs AuditLog.Read.All, \
+                    and the signed-in account needs a role that can read reports — \
+                    Reports Reader, Security Reader or Global Reader will do.";
+
+        // `$select` is not supported here, so the whole resource comes back
+        // whether or not it is wanted.
+        self.get_paged_optional(
+            &format!(
+                "/auditLogs/signIns?$filter={filter}&$top={}",
+                self.config.log_page_size()
+            ),
+            self.config.log_records(),
+            hint,
+        )
+        .await
+    }
+
+    /// Recent directory changes, newest first.
+    pub async fn directory_audits(&mut self) -> Result<Fetch<Vec<DirectoryAudit>>> {
+        let since = (chrono::Utc::now()
+            - chrono::Duration::days(self.config.log_days() as i64))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+        let filter = urlencoding::encode(&format!("activityDateTime ge {since}")).into_owned();
+
+        let hint = "This tenant does not expose the directory audit log. The app \
+                    registration needs AuditLog.Read.All, and the signed-in account \
+                    needs a role that can read reports — Reports Reader, Security \
+                    Reader or Global Reader will do.";
+
+        self.get_paged_optional(
+            &format!(
+                "/auditLogs/directoryAudits?$filter={filter}&$top={}",
+                self.config.log_page_size()
+            ),
+            self.config.log_records(),
+            hint,
+        )
+        .await
+    }
+
+    // ---- Microsoft Teams --------------------------------------------------
+
+    /// Every team in the tenant.
+    ///
+    /// `/teams` populates only id, displayName, description and visibility;
+    /// settings and archived state arrive per team from [`Self::team`].
+    pub async fn teams(&mut self) -> Result<Fetch<Vec<Team>>> {
+        let hint = "This tenant does not expose Microsoft Teams. Either Teams is not \
+                    licensed here, or the app registration has not been granted \
+                    Team.ReadBasic.All.";
+        let result = self
+            .get_all_optional::<Team>(&format!("/teams?$top={}", self.config.page_size()), hint)
+            .await?;
+
+        Ok(match result {
+            Fetch::Ready(mut teams) => {
+                teams.sort_by(|a, b| a.name().to_lowercase().cmp(&b.name().to_lowercase()));
+                Fetch::Ready(teams)
+            }
+            other => other,
+        })
+    }
+
+    /// One team in full, for the details pane.
+    pub async fn team(&mut self, team_id: &str) -> Result<Fetch<Team>> {
+        let hint = "The full settings for this team are not available. Reading them \
+                    needs TeamSettings.Read.All, which this app registration has not \
+                    been granted.";
+        self.get_one_optional(&format!("/teams/{}", urlencoding::encode(team_id)), hint)
+            .await
+    }
+
+    pub async fn team_channels(&mut self, team_id: &str) -> Result<Vec<Channel>> {
+        let mut channels: Vec<Channel> = self
+            .get_all(&format!(
+                "/teams/{}/channels?$select=id,displayName,description,membershipType,email,createdDateTime",
+                urlencoding::encode(team_id)
+            ))
+            .await?;
+        channels.sort_by(|a, b| a.name().to_lowercase().cmp(&b.name().to_lowercase()));
+        Ok(channels)
+    }
+
+    // ---- Exchange Online --------------------------------------------------
+
+    /// Every mailbox in the tenant, with its size against quota.
+    ///
+    /// There is no mailbox collection in Graph, so this reads the mailbox usage
+    /// report instead — see [`reports`] for why it is CSV rather than JSON.
+    pub async fn mailboxes(&mut self) -> Result<Fetch<Vec<Mailbox>>> {
+        let hint = "This tenant does not expose the mailbox usage report. Either \
+                    Exchange Online is not licensed here, or the app registration has \
+                    not been granted Reports.Read.All.";
+
+        let csv = match self
+            .get_report("/reports/getMailboxUsageDetail(period='D7')")
+            .await
+        {
+            Ok(csv) => csv,
+            Err(err) => {
+                let text = err.to_string();
+                return if is_feature_unavailable(&text) {
+                    Ok(Fetch::Unavailable(format!("{hint}\n\n{text}")))
+                } else {
+                    Err(err)
+                };
+            }
+        };
+
+        let mut mailboxes = reports::parse_mailbox_usage(&csv)?;
+        // Fullest mailboxes first: the one about to stop receiving mail is what
+        // this view exists to surface.
+        mailboxes.sort_by(|a, b| {
+            b.usage_fraction()
+                .total_cmp(&a.usage_fraction())
+                .then_with(|| a.name().to_lowercase().cmp(&b.name().to_lowercase()))
+        });
+        Ok(Fetch::Ready(mailboxes))
+    }
+
+    /// Mailbox settings for one user, fetched on demand.
+    ///
+    /// Delegated access to somebody else's mailbox settings depends on the
+    /// signed-in administrator actually having rights over that mailbox, so a
+    /// refusal here is ordinary rather than exceptional — hence [`Fetch`].
+    pub async fn mailbox_settings(&mut self, user_id: &str) -> Result<Fetch<MailboxSettings>> {
+        let hint = "These mailbox settings are not readable with the current sign-in. \
+                    Delegated access reaches your own mailbox and any you have been \
+                    granted rights over; reading every mailbox in the tenant needs the \
+                    MailboxSettings.Read application permission instead.";
+        self.get_one_optional(
+            &format!("/users/{}/mailboxSettings", urlencoding::encode(user_id)),
+            hint,
+        )
+        .await
+    }
+}
+
+/// Turn a fetch failure that means "you do not have this feature" into a
+/// reportable state, leaving real failures alone.
+fn optional<T>(result: Result<T>, unavailable_hint: &str) -> Result<Fetch<T>> {
+    match result {
+        Ok(value) => Ok(Fetch::Ready(value)),
+        Err(err) => {
+            let text = err.to_string();
+            if is_feature_unavailable(&text) {
+                Ok(Fetch::Unavailable(format!("{unavailable_hint}\n\n{text}")))
+            } else {
+                Err(err)
+            }
+        }
+    }
 }
 
 /// Distinguish "the tenant does not have this" from a real failure.
@@ -414,6 +628,11 @@ fn is_feature_unavailable(error_text: &str) -> bool {
         || lowered.contains("not licensed")
         || lowered.contains("tenant is not")
         || lowered.contains("does not have a valid")
+        // A tenant without Entra ID P1 refuses the sign-in log with this
+        // phrasing rather than with a status that says anything useful.
+        || lowered.contains("premium license")
+        || lowered.contains("requires a premium")
+        || lowered.contains("mailboxnotenabledforrestapi")
 }
 
 #[cfg(test)]
@@ -430,6 +649,16 @@ mod tests {
         ));
         assert!(is_feature_unavailable(
             "403 — Authorization_RequestDenied: Insufficient privileges"
+        ));
+        // The sign-in log on a tenant without Entra ID P1.
+        assert!(is_feature_unavailable(
+            "403 — Authentication_RequestFromUnsupportedUserRole: Neither tenant is \
+             B2C or tenant doesn't have premium license"
+        ));
+        // A user with no Exchange mailbox behind the account.
+        assert!(is_feature_unavailable(
+            "404 — MailboxNotEnabledForRESTAPI: The mailbox is either inactive or \
+             soft-deleted"
         ));
     }
 

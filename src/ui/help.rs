@@ -63,12 +63,16 @@ const GROUPS: &[Group] = &[
             ("{MOD}+4", "Devices"),
             ("{MOD}+5", "Managed Devices"),
             ("{MOD}+6", "Licenses"),
+            ("{MOD}+7", "Exchange mailboxes"),
+            ("{MOD}+8", "Teams"),
+            ("{MOD}+9", "Sign-in logs"),
         ],
     },
     Group {
         title: "Making changes",
         rows: &[
             ("{MOD}+Shift+W", "Turn write mode on or off"),
+            ("{MOD}+N", "Create a user account"),
             (
                 "Shift+F10",
                 "Open the actions menu for the selection (same as right-click)",
@@ -149,6 +153,17 @@ pub fn show(ctx: &egui::Context, open: &mut bool) {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Press Esc or F1 to close.").color(theme::MUTED));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // The one place somebody looks when something is wrong is
+                    // the help window, so the diagnostic log is named here.
+                    if ui
+                        .small_button("Open the error log")
+                        .on_hover_text(crate::errorlog::log_path().display().to_string())
+                        .clicked()
+                    {
+                        let _ = open::that_detached(crate::errorlog::log_path());
+                    }
+                });
             });
         });
     *open = still_open;
@@ -174,5 +189,32 @@ mod tests {
         let rendered = "{MOD}+F".replace("{MOD}", MOD);
         assert!(!rendered.contains("{MOD}"));
         assert!(rendered.ends_with("+F"));
+    }
+
+    /// This table and [`super::keys`] are kept in step by hand, which is exactly
+    /// the arrangement that drifts. A shortcut that exists but is not documented
+    /// is barely a feature; one that is documented but does not exist is worse.
+    #[test]
+    fn every_jump_shortcut_is_documented() {
+        let jumps = GROUPS
+            .iter()
+            .find(|group| group.title == "Jumping to a view")
+            .expect("the jump group must exist");
+
+        assert_eq!(
+            jumps.rows.len(),
+            super::super::keys::JUMP_KEYS.len(),
+            "the help table lists {} jump shortcuts but {} are bound",
+            jumps.rows.len(),
+            super::super::keys::JUMP_KEYS.len()
+        );
+
+        for (index, (keys, _)) in jumps.rows.iter().enumerate() {
+            assert_eq!(
+                *keys,
+                format!("{{MOD}}+{index}"),
+                "jump shortcuts must be documented in the order they are bound"
+            );
+        }
     }
 }

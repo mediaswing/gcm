@@ -71,6 +71,7 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
         copy: i.consume_key(Modifiers::COMMAND, Key::C),
         write_mode: i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::W),
         mark_all: i.consume_key(Modifiers::COMMAND, Key::A),
+        new_user: i.consume_key(Modifiers::COMMAND, Key::N),
         import_csv: i.consume_key(Modifiers::COMMAND, Key::I),
         export_csv: i.consume_key(Modifiers::COMMAND, Key::E),
         export_json: i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::E),
@@ -118,6 +119,9 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
     } else if pressed.mark_all {
         let view = app.view;
         app.view_state(view).mark_all_filtered();
+    }
+    if pressed.new_user {
+        app.new_user();
     }
     if pressed.import_csv {
         app.open_import();
@@ -212,6 +216,7 @@ struct Pressed {
     copy: bool,
     write_mode: bool,
     mark_all: bool,
+    new_user: bool,
     clear_marks: bool,
     import_csv: bool,
     export_csv: bool,
@@ -233,18 +238,26 @@ struct NavKeys {
     space: bool,
 }
 
-/// Ctrl+0 through Ctrl+6 jump straight to a node.
+/// Ctrl+0 through Ctrl+9 jump straight to a node.
+///
+/// The order matches the scope tree top to bottom, so the number is a position
+/// rather than something to memorise separately.
+pub const JUMP_KEYS: &[(Key, View)] = &[
+    (Key::Num0, View::Overview),
+    (Key::Num1, View::Users),
+    (Key::Num2, View::Groups),
+    (Key::Num3, View::Roles),
+    (Key::Num4, View::Devices),
+    (Key::Num5, View::ManagedDevices),
+    (Key::Num6, View::Licenses),
+    (Key::Num7, View::Mailboxes),
+    (Key::Num8, View::Teams),
+    (Key::Num9, View::SignIns),
+];
+
 fn jump_key(input: &mut egui::InputState) -> Option<View> {
-    const MAP: &[(Key, View)] = &[
-        (Key::Num0, View::Overview),
-        (Key::Num1, View::Users),
-        (Key::Num2, View::Groups),
-        (Key::Num3, View::Roles),
-        (Key::Num4, View::Devices),
-        (Key::Num5, View::ManagedDevices),
-        (Key::Num6, View::Licenses),
-    ];
-    MAP.iter()
+    JUMP_KEYS
+        .iter()
         .find(|(key, _)| input.consume_key(Modifiers::COMMAND, *key))
         .map(|(_, view)| *view)
 }

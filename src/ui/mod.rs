@@ -14,6 +14,7 @@ mod keys;
 mod list;
 mod menu;
 mod nav;
+mod quips;
 mod theme;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -35,6 +36,20 @@ pub const FRIENDLY_NAME: &str = "Graphical Cloud Manager";
 /// The access token is write-capable for the whole session, so an armed console
 /// left unattended is the real exposure. This bounds it.
 const WRITE_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Describe the slice of the logs a view covers.
+///
+/// Both halves matter and neither implies the other: an operator who reads only
+/// "last 7 days" will assume they are seeing all of it, and one who reads only
+/// "most recent 500" will not know how far back that reaches.
+fn describe_log_window(days: u32, records: usize) -> String {
+    let period = match days {
+        1 => "last 24 hours".to_string(),
+        7 => "last 7 days".to_string(),
+        other => format!("last {other} days"),
+    };
+    format!("{period}, most recent {records}")
+}
 
 /// How far through a batch the worker has got.
 #[derive(Debug, Clone, Copy)]
@@ -66,6 +81,10 @@ pub enum View {
     Devices,
     ManagedDevices,
     Licenses,
+    Mailboxes,
+    Teams,
+    SignIns,
+    AuditLogs,
 }
 
 impl View {
@@ -78,6 +97,10 @@ impl View {
             View::Devices => "Entra Devices",
             View::ManagedDevices => "Managed Devices (Intune)",
             View::Licenses => "Licenses",
+            View::Mailboxes => "Mailboxes (Exchange)",
+            View::Teams => "Teams",
+            View::SignIns => "Sign-in Logs",
+            View::AuditLogs => "Audit Logs",
         }
     }
 
@@ -91,7 +114,20 @@ impl View {
             View::Devices => Some(Collection::Devices),
             View::ManagedDevices => Some(Collection::ManagedDevices),
             View::Licenses => Some(Collection::Licenses),
+            View::Mailboxes => Some(Collection::Mailboxes),
+            View::Teams => Some(Collection::Teams),
+            View::SignIns => Some(Collection::SignIns),
+            View::AuditLogs => Some(Collection::AuditLogs),
         }
+    }
+
+    /// True for the views that read a log rather than a directory collection.
+    ///
+    /// These are bounded by time and record count rather than showing
+    /// everything, so the header says so — a count that silently stops at 500
+    /// would otherwise read as "that is all there is".
+    pub fn is_log(self) -> bool {
+        matches!(self, View::SignIns | View::AuditLogs)
     }
 }
 
@@ -124,11 +160,19 @@ struct Store {
     devices: Arc<Vec<Device>>,
     managed: Option<Fetch<Arc<Vec<ManagedDevice>>>>,
     licenses: Arc<Vec<SubscribedSku>>,
+    sign_ins: Option<Fetch<Arc<Vec<SignIn>>>>,
+    audits: Option<Fetch<Arc<Vec<DirectoryAudit>>>>,
+    teams: Option<Fetch<Arc<Vec<Team>>>>,
+    mailboxes: Option<Fetch<Arc<Vec<Mailbox>>>>,
 
     /// Lazily loaded details, keyed by object id.
     group_members: HashMap<String, (Arc<Vec<DirectoryMember>>, Arc<Vec<DirectoryMember>>)>,
     role_members: HashMap<String, Arc<Vec<DirectoryMember>>>,
     user_memberships: HashMap<String, Arc<Vec<DirectoryMember>>>,
+    /// Full team settings and channels, keyed by team id.
+    team_details: HashMap<String, (Fetch<Team>, Arc<Vec<Channel>>)>,
+    /// Mailbox settings, keyed by whichever identifier the request used.
+    mailbox_settings: HashMap<String, Fetch<MailboxSettings>>,
     /// Detail requests already in flight, so we ask only once per object.
     requested: HashSet<String>,
 
@@ -153,17 +197,57 @@ impl Store {
 
     /// Number of rows a view will show before filtering.
     fn count(&self, view: View) -> Option<usize> {
+        /// A collection the tenant may not offer has no count until it arrives.
+        fn ready<T>(fetch: &Option<Fetch<Arc<Vec<T>>>>) -> Option<usize> {
+            match fetch {
+                Some(Fetch::Ready(items)) => Some(items.len()),
+                _ => None,
+            }
+        }
+
         match view {
             View::Overview => None,
             View::Users => Some(self.users.len()),
             View::Groups => Some(self.groups.len()),
             View::Roles => Some(self.roles.len()),
             View::Devices => Some(self.devices.len()),
-            View::ManagedDevices => match &self.managed {
-                Some(Fetch::Ready(devices)) => Some(devices.len()),
-                _ => None,
-            },
             View::Licenses => Some(self.licenses.len()),
+            View::ManagedDevices => ready(&self.managed),
+            View::Mailboxes => ready(&self.mailboxes),
+            View::Teams => ready(&self.teams),
+            View::SignIns => ready(&self.sign_ins),
+            View::AuditLogs => ready(&self.audits),
+        }
+    }
+
+    /// The reason a view has nothing to show, when the tenant does not offer it.
+    ///
+    /// One accessor rather than a `match` at every call site, so a new optional
+    /// collection cannot be added and then silently render an empty table.
+    fn unavailable(&self, view: View) -> Option<&str> {
+        fn reason<T>(fetch: &Option<Fetch<T>>) -> Option<&str> {
+            match fetch {
+                Some(Fetch::Unavailable(reason)) => Some(reason.as_str()),
+                _ => None,
+            }
+        }
+
+        match view {
+            View::ManagedDevices => reason(&self.managed),
+            View::Mailboxes => reason(&self.mailboxes),
+            View::Teams => reason(&self.teams),
+            View::SignIns => reason(&self.sign_ins),
+            View::AuditLogs => reason(&self.audits),
+            _ => None,
+        }
+    }
+
+    /// The rows of an optional collection, or an empty slice while it is
+    /// loading or unavailable.
+    fn optional<T>(fetch: &Option<Fetch<Arc<Vec<T>>>>) -> Arc<Vec<T>> {
+        match fetch {
+            Some(Fetch::Ready(items)) => items.clone(),
+            _ => Arc::new(Vec::new()),
         }
     }
 }
@@ -281,6 +365,9 @@ pub struct App {
 
     account: Option<String>,
     tenant_label: String,
+    /// The window the log views cover, as configured. Kept as text because the
+    /// only thing the UI does with it is say it out loud.
+    log_window: String,
     show_help: bool,
     show_details: bool,
     /// Set when a shortcut asks for the filter box to take focus next frame.
@@ -319,6 +406,7 @@ impl App {
 
         let ctx = cc.egui_ctx.clone();
         let tenant_label = config.tenant_id().to_string();
+        let log_window = describe_log_window(config.log_days(), config.log_records());
         let worker = Worker::spawn(config, move || ctx.request_repaint());
 
         let (worker, phase) = match worker {
@@ -344,6 +432,7 @@ impl App {
             views: HashMap::new(),
             account: None,
             tenant_label,
+            log_window,
             show_help: false,
             show_details: true,
             focus_filter: false,
@@ -378,6 +467,10 @@ impl App {
             devices: demo::devices(),
             managed: Some(demo::managed_devices()),
             licenses: demo::licenses(),
+            mailboxes: Some(demo::mailboxes()),
+            teams: Some(demo::teams()),
+            sign_ins: Some(demo::sign_ins()),
+            audits: Some(demo::audits()),
             ..Default::default()
         };
 
@@ -399,6 +492,24 @@ impl App {
                 .user_memberships
                 .insert(user.id.clone(), demo::members(2 + index % 3, index));
         }
+        if let Some(Fetch::Ready(teams)) = &store.teams {
+            let details: Vec<_> = teams
+                .iter()
+                .map(|team| (team.id.clone(), demo::team_detail(team)))
+                .collect();
+            store.team_details.extend(details);
+        }
+        if let Some(Fetch::Ready(mailboxes)) = &store.mailboxes {
+            let settings: Vec<_> = mailboxes
+                .iter()
+                .map(|mailbox| {
+                    let upn = mailbox.user_principal_name.clone();
+                    let settings = demo::mailbox_settings(&upn);
+                    (upn, settings)
+                })
+                .collect();
+            store.mailbox_settings.extend(settings);
+        }
 
         let mut expanded = HashSet::new();
         expanded.insert("groups");
@@ -415,6 +526,7 @@ impl App {
             views: HashMap::new(),
             account: Some("demo@contoso.co.uk".into()),
             tenant_label: "Contoso Demonstration (demo data)".into(),
+            log_window: describe_log_window(7, 500),
             show_help: false,
             show_details: true,
             focus_filter: false,
@@ -449,6 +561,7 @@ impl App {
             views: HashMap::new(),
             account: None,
             tenant_label: String::new(),
+            log_window: String::new(),
             show_help: false,
             show_details: true,
             focus_filter: false,
@@ -469,6 +582,11 @@ impl App {
 
     pub fn view_state(&mut self, view: View) -> &mut ViewState {
         self.views.entry(view).or_default()
+    }
+
+    /// What the log views cover, for the caption beside their item count.
+    pub fn log_window_caption(&self) -> &str {
+        &self.log_window
     }
 
     fn send(&self, command: Command) {
@@ -553,6 +671,97 @@ impl App {
         use crate::graph::actions::MemberRole;
 
         match action {
+            Action::CreateUser { spec } => {
+                let users = Arc::make_mut(&mut self.store.users);
+                if users
+                    .iter()
+                    .any(|user| user.upn().eq_ignore_ascii_case(&spec.user_principal_name))
+                {
+                    return Err("a user with that sign-in name already exists".into());
+                }
+                users.push(User {
+                    id: format!("user-{:04}", users.len() + 100),
+                    display_name: Some(spec.display_name.clone()),
+                    user_principal_name: Some(spec.user_principal_name.clone()),
+                    mail: Some(spec.user_principal_name.clone()),
+                    job_title: spec.job_title.clone(),
+                    department: spec.department.clone(),
+                    account_enabled: Some(spec.account_enabled),
+                    user_type: Some("Member".into()),
+                    created_date_time: Some(chrono::Utc::now()),
+                    usage_location: spec.usage_location.clone(),
+                    ..Default::default()
+                });
+                users.sort_by(|a, b| a.name().to_lowercase().cmp(&b.name().to_lowercase()));
+                Ok(())
+            }
+
+            Action::Team { id, op, .. } => {
+                use crate::graph::actions::TeamOp;
+                let Some(Fetch::Ready(teams)) = &mut self.store.teams else {
+                    return Err("teams are not loaded".into());
+                };
+                let teams = Arc::make_mut(teams);
+                match op {
+                    TeamOp::Delete => {
+                        let before = teams.len();
+                        teams.retain(|team| &team.id != id);
+                        if teams.len() == before {
+                            return Err("no such team".into());
+                        }
+                        self.store.team_details.remove(id);
+                        Ok(())
+                    }
+                    TeamOp::Archive | TeamOp::Unarchive => {
+                        let team = teams
+                            .iter_mut()
+                            .find(|team| &team.id == id)
+                            .ok_or("no such team")?;
+                        team.is_archived = Some(*op == TeamOp::Archive);
+                        Ok(())
+                    }
+                }
+            }
+
+            Action::SetAutomaticReplies { name, spec, .. } => {
+                // Keyed by UPN, as the real store is; the action carries an
+                // object id, so the mailbox is found by name instead.
+                let key = self
+                    .store
+                    .mailbox_settings
+                    .keys()
+                    .find(|upn| {
+                        self.store
+                            .mailboxes
+                            .as_ref()
+                            .and_then(|fetch| match fetch {
+                                Fetch::Ready(mailboxes) => Some(mailboxes),
+                                _ => None,
+                            })
+                            .is_some_and(|mailboxes| {
+                                mailboxes.iter().any(|mailbox| {
+                                    &mailbox.user_principal_name == *upn
+                                        && mailbox.name() == name
+                                })
+                            })
+                    })
+                    .cloned()
+                    .ok_or("no such mailbox")?;
+
+                let Some(Fetch::Ready(settings)) = self.store.mailbox_settings.get_mut(&key)
+                else {
+                    return Err("those mailbox settings are not readable".into());
+                };
+                settings.automatic_replies_setting = Some(AutomaticReplies {
+                    status: Some(if spec.enabled { "alwaysEnabled" } else { "disabled" }.into()),
+                    external_audience: Some(spec.external_audience.clone()),
+                    internal_reply_message: Some(spec.internal_message.clone()),
+                    external_reply_message: Some(spec.external_message.clone()),
+                    ..Default::default()
+                });
+                Ok(())
+            }
+
             Action::SetUserEnabled { id, enabled, .. } => {
                 let users = Arc::make_mut(&mut self.store.users);
                 let user = users
@@ -801,6 +1010,32 @@ impl App {
                 self.store.licenses = licenses;
                 self.finish(Collection::Licenses);
             }
+            Event::SignIns(fetch) => {
+                self.store.sign_ins = Some(fetch);
+                self.finish(Collection::SignIns);
+            }
+            Event::AuditLogs(fetch) => {
+                self.store.audits = Some(fetch);
+                self.finish(Collection::AuditLogs);
+            }
+            Event::Teams(fetch) => {
+                self.store.teams = Some(fetch);
+                self.finish(Collection::Teams);
+            }
+            Event::Mailboxes(fetch) => {
+                self.store.mailboxes = Some(fetch);
+                self.finish(Collection::Mailboxes);
+            }
+            Event::TeamDetail {
+                team_id,
+                team,
+                channels,
+            } => {
+                self.store.team_details.insert(team_id, (*team, channels));
+            }
+            Event::MailboxSettings { key, settings } => {
+                self.store.mailbox_settings.insert(key, *settings);
+            }
             Event::GroupMembers {
                 group_id,
                 members,
@@ -977,14 +1212,24 @@ impl App {
     }
 
     /// Ask the worker for details of the selected object, once per object.
+    ///
+    /// The key is prefixed by view because two collections can legitimately
+    /// share an id — a team and the group behind it have the same one, and
+    /// without the prefix selecting the team would be silently satisfied by the
+    /// group's already-requested membership.
     fn ensure_details(&mut self) {
         let request = match self.view {
-            View::Users => self
-                .selected_user()
-                .map(|user| (user.id.clone(), Command::UserMemberships { user_id: user.id.clone() })),
+            View::Users => self.selected_user().map(|user| {
+                (
+                    format!("user:{}", user.id),
+                    Command::UserMemberships {
+                        user_id: user.id.clone(),
+                    },
+                )
+            }),
             View::Groups => self.selected_group().map(|group| {
                 (
-                    group.id.clone(),
+                    format!("group:{}", group.id),
                     Command::GroupMembers {
                         group_id: group.id.clone(),
                     },
@@ -992,17 +1237,42 @@ impl App {
             }),
             View::Roles => self.selected_role().map(|role| {
                 (
-                    role.id.clone(),
+                    format!("role:{}", role.id),
                     Command::RoleMembers {
                         role_id: role.id.clone(),
                     },
                 )
             }),
+            View::Teams => self.selected_team().map(|team| {
+                (
+                    format!("team:{}", team.id),
+                    Command::TeamDetail {
+                        team_id: team.id.clone(),
+                    },
+                )
+            }),
+            View::Mailboxes => self.selected_mailbox().map(|mailbox| {
+                let key = Self::mailbox_settings_key(mailbox).to_string();
+                // Prefer the directory object id where the account is loaded:
+                // Graph accepts either, and an object id cannot be tripped up
+                // by a UPN the report anonymised.
+                let lookup = self
+                    .store
+                    .users
+                    .iter()
+                    .find(|user| user.upn().eq_ignore_ascii_case(&key))
+                    .map(|user| user.id.clone())
+                    .unwrap_or_else(|| key.clone());
+                (
+                    format!("mailbox:{key}"),
+                    Command::MailboxSettings { lookup, key },
+                )
+            }),
             _ => None,
         };
 
-        if let Some((id, command)) = request
-            && self.store.requested.insert(id)
+        if let Some((key, command)) = request
+            && self.store.requested.insert(key)
         {
             self.send(command);
         }
@@ -1021,6 +1291,27 @@ impl App {
     fn selected_role(&self) -> Option<&DirectoryRole> {
         let state = self.views.get(&View::Roles)?;
         self.store.roles.get(state.selected_source()?)
+    }
+
+    fn selected_team(&self) -> Option<&Team> {
+        let state = self.views.get(&View::Teams)?;
+        match &self.store.teams {
+            Some(Fetch::Ready(teams)) => teams.get(state.selected_source()?),
+            _ => None,
+        }
+    }
+
+    fn selected_mailbox(&self) -> Option<&Mailbox> {
+        let state = self.views.get(&View::Mailboxes)?;
+        match &self.store.mailboxes {
+            Some(Fetch::Ready(mailboxes)) => mailboxes.get(state.selected_source()?),
+            _ => None,
+        }
+    }
+
+    /// The identifier the mailbox settings cache is keyed by for a mailbox.
+    fn mailbox_settings_key(mailbox: &Mailbox) -> &str {
+        &mailbox.user_principal_name
     }
 
     /// Rebuild the filtered index list for the current view.
@@ -1056,10 +1347,7 @@ impl App {
                     .refresh(version, len, |i, needle| list::device_matches(&data[i], needle));
             }
             View::ManagedDevices => {
-                let data = match &self.store.managed {
-                    Some(Fetch::Ready(devices)) => devices.clone(),
-                    _ => Arc::new(Vec::new()),
-                };
+                let data = Store::optional(&self.store.managed);
                 let len = data.len();
                 self.view_state(view).refresh(version, len, |i, needle| {
                     list::managed_matches(&data[i], needle)
@@ -1070,6 +1358,32 @@ impl App {
                 let len = data.len();
                 self.view_state(view)
                     .refresh(version, len, |i, needle| list::sku_matches(&data[i], needle));
+            }
+            View::Mailboxes => {
+                let data = Store::optional(&self.store.mailboxes);
+                let len = data.len();
+                self.view_state(view).refresh(version, len, |i, needle| {
+                    list::mailbox_matches(&data[i], needle)
+                });
+            }
+            View::Teams => {
+                let data = Store::optional(&self.store.teams);
+                let len = data.len();
+                self.view_state(view)
+                    .refresh(version, len, |i, needle| list::team_matches(&data[i], needle));
+            }
+            View::SignIns => {
+                let data = Store::optional(&self.store.sign_ins);
+                let len = data.len();
+                self.view_state(view).refresh(version, len, |i, needle| {
+                    list::sign_in_matches(&data[i], needle)
+                });
+            }
+            View::AuditLogs => {
+                let data = Store::optional(&self.store.audits);
+                let len = data.len();
+                self.view_state(view)
+                    .refresh(version, len, |i, needle| list::audit_matches(&data[i], needle));
             }
         }
     }
@@ -1169,11 +1483,20 @@ impl App {
         };
 
         if palette.is_empty() {
-            self.status = format!("No actions available for {}", view.title());
+            self.status = quips::nothing_to_do(view.title());
             return;
         }
 
         self.palette = Some(palette);
+    }
+
+    /// Open the create-user form, and move to the Users node so the new account
+    /// is visible in the list the moment it is created.
+    fn new_user(&mut self) {
+        self.open_form(forms::Form::create_user());
+        if self.form.is_some() {
+            self.go_to(View::Users);
+        }
     }
 
     /// Open a form, refusing while read-only so the gate is one rule, not two.
@@ -1367,6 +1690,27 @@ impl App {
                 {
                     self.show_details = !self.show_details;
                 }
+
+                ui.separator();
+
+                // Always present rather than only on the Users node: creating
+                // an account is an errand somebody arrives with, not something
+                // they navigate to first.
+                if ui
+                    .add_enabled(
+                        self.write_mode.is_armed(),
+                        egui::Button::new("New user…"),
+                    )
+                    .on_hover_text("Create a user account (Ctrl+N)")
+                    .on_disabled_hover_text(
+                        "Enable write mode (Ctrl+Shift+W) to create an account",
+                    )
+                    .clicked()
+                {
+                    self.new_user();
+                }
+
+                ui.separator();
 
                 if ui
                     .button("Keyboard help")
@@ -1643,10 +1987,26 @@ impl App {
                 if ui.button("Copy the file path").clicked() {
                     ui.ctx().copy_text(config_path().display().to_string());
                 }
+                if ui
+                    .button("Open the error log")
+                    .on_hover_text(crate::errorlog::log_path().display().to_string())
+                    .clicked()
+                {
+                    let _ = open::that_detached(crate::errorlog::log_path());
+                }
                 if ui.button("Quit").clicked() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new(format!(
+                    "Diagnostics are written to {}",
+                    crate::errorlog::log_path().display()
+                ))
+                .small()
+                .color(theme::MUTED),
+            );
         });
     }
 }

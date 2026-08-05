@@ -7,10 +7,12 @@
 #
 # token.json is the one that genuinely matters: it holds a refresh token, a
 # bearer credential for the tenant. config.ini holds no secret, but it does name
-# which tenant is being administered. actions.log records who changed what.
+# which tenant is being administered. actions.log records who changed what, and
+# error.log names accounts, tenants and object ids while diagnosing failures.
 config.ini
 token.json
 actions.log
+error.log
 
 # Exports, which contain real directory data — names, addresses, device serial
 # numbers. Matched on the names the export dialog suggests rather than on *.csv

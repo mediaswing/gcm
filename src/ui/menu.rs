@@ -13,7 +13,8 @@
 use super::forms::{Form, UserFields};
 use super::{App, View};
 use crate::graph::Fetch;
-use crate::graph::actions::{Action, DeviceOp, MemberRole, Severity};
+use crate::graph::actions::{Action, AutoReplySpec, DeviceOp, MemberRole, Severity, TeamOp};
+use crate::graph::models::AutomaticReplies;
 
 /// Which form an item opens, built lazily so the store is not borrowed while
 /// the menu is still being drawn from it.
@@ -34,6 +35,13 @@ pub enum FormFactory {
         description: String,
     },
     CreateGroup,
+    CreateUser,
+    /// Edit somebody's automatic replies, seeded with whatever is set now.
+    AutomaticReplies {
+        id: String,
+        name: String,
+        current: Box<Option<AutomaticReplies>>,
+    },
     PickLicense {
         user_id: String,
         user_name: String,
@@ -82,6 +90,10 @@ impl FormFactory {
                 description: String::new(),
                 unified: false,
             },
+            FormFactory::CreateUser => Form::create_user(),
+            FormFactory::AutomaticReplies { id, name, current } => {
+                Form::automatic_replies(id, name, *current)
+            }
             FormFactory::PickLicense {
                 user_id,
                 user_name,
@@ -163,9 +175,16 @@ pub fn for_object(app: &App, view: View, source: usize) -> Vec<Item> {
         View::Groups => group_items(app, source),
         View::Devices => device_items(app, source),
         View::ManagedDevices => managed_items(app, source),
+        View::Teams => team_items(app, source),
+        View::Mailboxes => mailbox_items(app, source),
         // Roles and licences are read-only surfaces: role assignment is done
         // by editing the role's members, and licences by editing a user.
-        View::Roles | View::Licenses | View::Overview => Vec::new(),
+        //
+        // The logs are read-only in a stronger sense — there is nothing in
+        // Graph that could change a past sign-in, and there should not be.
+        View::Roles | View::Licenses | View::Overview | View::SignIns | View::AuditLogs => {
+            Vec::new()
+        }
     }
 }
 
@@ -178,6 +197,10 @@ fn user_items(app: &App, source: usize) -> Vec<Item> {
     let enabled = user.account_enabled.unwrap_or(false);
 
     vec![
+        // First, because creating an account is the errand somebody arrives at
+        // the Users node to run, and it does not depend on what is selected.
+        Item::open("New user…", FormFactory::CreateUser),
+        Item::Separator,
         Item::act(
             if enabled {
                 "Disable account"
@@ -361,6 +384,109 @@ fn managed_items(app: &App, source: usize) -> Vec<Item> {
     ]
 }
 
+fn team_items(app: &App, source: usize) -> Vec<Item> {
+    let teams = match &app.store.teams {
+        Some(Fetch::Ready(teams)) => teams,
+        _ => return Vec::new(),
+    };
+    let Some(team) = teams.get(source) else {
+        return Vec::new();
+    };
+    let id = team.id.clone();
+    let name = team.name().to_string();
+
+    let op = |label: &str, op: TeamOp| {
+        Item::act(
+            label,
+            Action::Team {
+                id: id.clone(),
+                name: name.clone(),
+                op,
+            },
+        )
+    };
+
+    // Only ever one of the pair: offering "Archive" on an archived team would
+    // be a button that exists solely to return an error.
+    let mut items = vec![if team.archived() {
+        op("Restore", TeamOp::Unarchive)
+    } else {
+        op("Archive", TeamOp::Archive)
+    }];
+
+    items.push(Item::Separator);
+    items.push(op("Delete team", TeamOp::Delete));
+    items
+}
+
+fn mailbox_items(app: &App, source: usize) -> Vec<Item> {
+    let mailboxes = match &app.store.mailboxes {
+        Some(Fetch::Ready(mailboxes)) => mailboxes,
+        _ => return Vec::new(),
+    };
+    let Some(mailbox) = mailboxes.get(source) else {
+        return Vec::new();
+    };
+
+    // A report that has been anonymised gives no usable identifier, so there is
+    // nothing that could be acted on even if the permissions were there.
+    if mailbox.is_concealed() || mailbox.user_principal_name.is_empty() {
+        return Vec::new();
+    }
+
+    let upn = mailbox.user_principal_name.clone();
+    let name = mailbox.name().to_string();
+
+    // Prefer the directory object id, falling back to the UPN — Graph accepts
+    // either, and a mailbox can appear in the report for an account this
+    // console never loaded.
+    let id = app
+        .store
+        .users
+        .iter()
+        .find(|user| user.upn().eq_ignore_ascii_case(&upn))
+        .map(|user| user.id.clone())
+        .unwrap_or_else(|| upn.clone());
+
+    let current = app
+        .store
+        .mailbox_settings
+        .get(&upn)
+        .and_then(|settings| match settings {
+            Fetch::Ready(settings) => settings.automatic_replies_setting.clone(),
+            Fetch::Unavailable(_) => None,
+        });
+
+    let mut items = vec![Item::open(
+        "Set automatic replies…",
+        FormFactory::AutomaticReplies {
+            id: id.clone(),
+            name: name.clone(),
+            current: Box::new(current.clone()),
+        },
+    )];
+
+    // The direct "off" switch only appears when replies are demonstrably on,
+    // so it never claims to have turned off something that was already off.
+    if current.as_ref().is_some_and(|replies| replies.is_on()) {
+        items.push(Item::act(
+            "Turn off automatic replies",
+            Action::SetAutomaticReplies {
+                id,
+                name,
+                spec: Box::new(AutoReplySpec {
+                    enabled: false,
+                    internal_message: String::new(),
+                    external_message: String::new(),
+                    external_audience: "all".into(),
+                }),
+            },
+        ));
+    }
+
+    items
+}
+
 /// Bulk actions applicable to every object in `marked`.
 ///
 /// Only actions that make sense for the whole set are offered: a bulk button
@@ -483,7 +609,59 @@ pub fn bulk_for(app: &App, view: View, marked: &[usize]) -> Vec<(String, Vec<Act
             }
         }
 
-        View::Roles | View::Licenses | View::Overview => {}
+        View::Teams => {
+            // Archive and restore are offered separately rather than as a
+            // toggle: a mixed selection has no sensible "toggle", and half the
+            // batch failing is exactly what `push` refuses to allow.
+            let teams = match &app.store.teams {
+                Some(Fetch::Ready(teams)) => teams.clone(),
+                _ => return out,
+            };
+            for (label, op, wanted) in [
+                ("Archive", TeamOp::Archive, false),
+                ("Restore", TeamOp::Unarchive, true),
+            ] {
+                push(
+                    label,
+                    marked
+                        .iter()
+                        .filter_map(|source| {
+                            let team = teams.get(*source)?;
+                            // Only teams the operation would actually change.
+                            (team.archived() == wanted).then(|| Action::Team {
+                                id: team.id.clone(),
+                                name: team.name().to_string(),
+                                op,
+                            })
+                        })
+                        .collect(),
+                );
+            }
+            push(
+                "Delete",
+                marked
+                    .iter()
+                    .filter_map(|source| {
+                        let team = teams.get(*source)?;
+                        Some(Action::Team {
+                            id: team.id.clone(),
+                            name: team.name().to_string(),
+                            op: TeamOp::Delete,
+                        })
+                    })
+                    .collect(),
+            );
+        }
+
+        // Mailboxes carry one action, and applying the same out-of-office
+        // message to a ticked set of people is not something anybody wants.
+        // The logs, roles and licences have nothing to act on at all.
+        View::Mailboxes
+        | View::Roles
+        | View::Licenses
+        | View::Overview
+        | View::SignIns
+        | View::AuditLogs => {}
     }
 
     out

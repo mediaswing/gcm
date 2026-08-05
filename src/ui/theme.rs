@@ -6,7 +6,11 @@
 //! status, never decoration, which also keeps the contrast budget available
 //! where it carries meaning.
 
-use egui::{Color32, CornerRadius, Stroke, Visuals};
+use egui::{Color32, CornerRadius, FontData, FontDefinitions, FontFamily, Stroke, Visuals};
+
+/// Ubuntu Bold, bundled so the console looks the same on a fresh Windows
+/// install as it does on a developer's Mac.
+const UBUNTU_BOLD: &[u8] = include_bytes!("../../assets/fonts/Ubuntu-Bold.ttf");
 
 /// Selection blue, used for the selected row in whichever pane has focus.
 pub const ACCENT: Color32 = Color32::from_rgb(0, 90, 158);
@@ -25,7 +29,38 @@ pub const MUTED: Color32 = Color32::from_rgb(110, 118, 128);
 /// point of a management console.
 pub const ROW_HEIGHT: f32 = 22.0;
 
+/// Installs Ubuntu Bold as the default proportional face for all text.
+///
+/// egui ships only Ubuntu-Light, and `RichText::strong()` recolours rather than
+/// selecting a heavier face, so a bold weight has to arrive as an actual font.
+/// Putting it first in the `Proportional` chain means every widget picks it up
+/// without each call site having to ask.
+///
+/// Everything egui already had stays *behind* it in the chain — Ubuntu-Light,
+/// whose metrics match, plus the emoji fonts — so a glyph Ubuntu-Bold does not
+/// cover still renders instead of turning into a tofu box. That matters here:
+/// the tree draws `▸`/`▾` as painted triangles precisely because the stock font
+/// had no glyph for them, and the tick in the result list is a real `✓`.
+///
+/// Rebuilding the glyph atlas is expensive, so this is called once per
+/// [`apply`], which itself runs once per constructor — never per frame.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        "Ubuntu-Bold".to_owned(),
+        std::sync::Arc::new(FontData::from_static(UBUNTU_BOLD)),
+    );
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .insert(0, "Ubuntu-Bold".to_owned());
+    ctx.set_fonts(fonts);
+}
+
 pub fn apply(ctx: &egui::Context) {
+    install_fonts(ctx);
+
     // The console is a light-mode tool: MMC's information density depends on
     // hairline separators and banding that do not survive a dark inversion.
     ctx.set_theme(egui::ThemePreference::Light);
@@ -66,12 +101,16 @@ pub fn apply(ctx: &egui::Context) {
     });
 }
 
-/// Colour for a compliance or enablement status string.
+/// Colour for a compliance, enablement or outcome status string.
+///
+/// Keyed on the displayed text rather than on an enum so that every pane
+/// colours the same word the same way, whichever model it came from.
 pub fn status_color(text: &str) -> Color32 {
     match text {
-        "Enabled" | "Compliant" | "Yes" => OK,
-        "In grace period" | "Unknown" | "Conflict" => WARN,
-        "Disabled" | "Not compliant" | "Error" => BAD,
+        "Enabled" | "Compliant" | "Yes" | "Success" | "Active" | "On" => OK,
+        "In grace period" | "Unknown" | "Conflict" | "Timeout" | "Archived"
+        | "Scheduled" => WARN,
+        "Disabled" | "Not compliant" | "Error" | "Failure" => BAD,
         _ => MUTED,
     }
 }
