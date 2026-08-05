@@ -678,6 +678,28 @@ fn context_menu(app: &mut App, response: &egui::Response, view: View, source: us
     });
 }
 
+/// One row as plain values, for export.
+///
+/// Shares `cell` with the table, so an exported file cannot drift from what was
+/// on screen. The licence usage column is a bar rather than text, so it is
+/// rendered here as the percentage it depicts.
+pub fn export_row(app: &App, view: View, source: usize) -> Vec<String> {
+    let cols = columns(view);
+    (0..cols.len())
+        .map(|index| {
+            if view == View::Licenses && index == cols.len() - 1 {
+                app.store
+                    .licenses
+                    .get(source)
+                    .map(|sku| format!("{:.0}%", sku.usage_fraction() * 100.0))
+                    .unwrap_or_default()
+            } else {
+                cell(app, view, source, index)
+            }
+        })
+        .collect()
+}
+
 /// The primary name of a row, for menu titles.
 pub fn row_name(app: &App, view: View, source: usize) -> String {
     cell(app, view, source, 0)

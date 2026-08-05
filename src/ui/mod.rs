@@ -6,8 +6,10 @@
 
 mod confirm;
 mod details;
+mod export;
 mod forms;
 mod help;
+mod import;
 mod keys;
 mod list;
 mod menu;
@@ -300,6 +302,8 @@ pub struct App {
     form: Option<forms::Form>,
     /// The keyboard route to the actions menu (Shift+F10).
     palette: Option<menu::Palette>,
+    /// A parsed import awaiting the operator's approval.
+    import: Option<crate::importer::Plan>,
     /// Outcome of the most recent action, shown in the status bar.
     last_action: Option<Result<String, String>>,
     /// A batch in flight.
@@ -350,6 +354,7 @@ impl App {
             pending: None,
             form: None,
             palette: None,
+            import: None,
             batch: None,
             batch_failures: None,
             last_action: None,
@@ -420,6 +425,7 @@ impl App {
             pending: None,
             form: None,
             palette: None,
+            import: None,
             batch: None,
             batch_failures: None,
             last_action: None,
@@ -453,6 +459,7 @@ impl App {
             pending: None,
             form: None,
             palette: None,
+            import: None,
             batch: None,
             batch_failures: None,
             last_action: None,
@@ -1101,6 +1108,7 @@ impl eframe::App for App {
             || self.arming
             || self.form.is_some()
             || self.palette.is_some()
+            || self.import.is_some()
             || self.batch_failures.is_some();
         if !modal_open {
             keys::handle(self, &ctx);
@@ -1251,6 +1259,15 @@ impl App {
         // operator learns what a partial batch actually changed.
         if self.batch_failures.is_some() {
             self.failure_modal(ctx);
+            return;
+        }
+
+        if let Some(plan) = self.import.take() {
+            match import::show(ctx, &plan, self.write_mode.is_armed()) {
+                import::Outcome::Apply => self.request_actions(plan.actions),
+                import::Outcome::Cancelled => self.status = "Import cancelled".into(),
+                import::Outcome::Pending => self.import = Some(plan),
+            }
             return;
         }
 
@@ -1467,6 +1484,70 @@ impl App {
             });
             ui.add_space(2.0);
         });
+    }
+
+    /// Read a CSV and show what it would do. Nothing runs until approved.
+    fn open_import(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Comma-separated values", &["csv"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) => {
+                self.last_action =
+                    Some(Err(format!("Could not read {}: {err}", path.display())));
+                return;
+            }
+        };
+
+        let source = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+
+        let directory = crate::importer::Directory {
+            users: &self.store.users,
+            groups: &self.store.groups,
+            licences: &self.store.licenses,
+        };
+
+        match crate::importer::plan(&text, source, directory) {
+            Ok(plan) => {
+                self.status = format!(
+                    "{} to apply, {} skipped",
+                    plan.actions.len(),
+                    plan.skipped.len()
+                );
+                self.import = Some(plan);
+            }
+            Err(err) => {
+                self.last_action = Some(Err(format!("Import failed: {err:#}")));
+                self.status = "Could not read that file".into();
+            }
+        }
+    }
+
+    /// Write the current view to a file the operator chooses.
+    fn export(&mut self, format: export::Format) {
+        if self.view == View::Overview {
+            self.status = "There is nothing to export from the console root".into();
+            return;
+        }
+        match export::save(self, self.view, format) {
+            Ok(Some(path)) => {
+                self.status = format!("Exported to {}", path.display());
+            }
+            // Cancelling the dialog is not a failure.
+            Ok(None) => {}
+            Err(err) => {
+                self.last_action = Some(Err(format!("Export failed: {err:#}")));
+                self.status = "Export failed".into();
+            }
+        }
     }
 
     pub fn refresh_current(&mut self) {

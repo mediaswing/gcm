@@ -280,6 +280,63 @@ The alternative, incremental consent, would make read-only genuinely enforced by
 Entra at the cost of a device-code entry each session. That trade was considered
 and settled in favour of the simpler flow; switching later is possible.
 
+## Import and export
+
+`Ctrl+E` writes the current view to CSV, `Ctrl+Shift+E` to JSON. Both honour the
+active filter and the visible columns, and read through the same accessors the
+table renders from — so an exported file cannot quietly differ from what was on
+screen.
+
+`Ctrl+I` imports a CSV. Nothing runs on opening it: gcm resolves every row
+against the directory and shows a preview of what it *would* do, then hands the
+result to the same confirmation and worker gate as any other batch.
+
+Rows it cannot resolve are skipped rather than aborting the file, and the
+preview names every one with its reason — a typo in one row must never become a
+silent no-op. There is a **Copy skipped rows** button for fixing the source.
+
+Three file shapes are recognised, from the header row. Column names are matched
+ignoring case, spaces and underscores, so `User Principal Name`,
+`userPrincipalName` and `upn` are the same thing.
+
+**User attributes** — keyed on the user, one row each:
+
+```csv
+userPrincipalName,jobTitle,department,officeLocation,mobilePhone,usageLocation
+aisha@contoso.co.uk,Finance Director,Finance,London,+44 7700 900001,GB
+```
+
+Only the columns present are touched; anything omitted is left alone. An empty
+cell **clears** that attribute, which is the only way a spreadsheet can say
+"remove this value".
+
+**Group membership** — `action` defaults to `add` if the column is absent, and
+`role` may be `member` (default) or `owner`:
+
+```csv
+group,member,action,role
+Finance Team,ben@contoso.co.uk,add,member
+Project Falcon,aisha@contoso.co.uk,remove,owner
+```
+
+Dynamic groups are refused with a reason: Entra recomputes their membership from
+the rule, so the change would simply be reverted.
+
+**Licences** — the SKU may be a part number, a product name, or a SKU id:
+
+```csv
+userPrincipalName,sku,action
+ben@contoso.co.uk,SPE_E3,assign
+chloe@contoso.co.uk,Power BI Pro,remove
+```
+
+Rows that would assign a licence someone already holds, or remove one they do
+not, are skipped before they reach Graph, where they would simply fail.
+
+Import covers attributes, membership and licences. It deliberately cannot create
+or delete objects, or enable and disable accounts — those stay deliberate,
+one-at-a-time or bulk-selected actions in the console.
+
 ## Keyboard
 
 Press **F1** in the app for the same table. On macOS, `Ctrl` below is `Cmd`.

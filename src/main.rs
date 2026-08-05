@@ -18,6 +18,7 @@ mod config;
 #[cfg(debug_assertions)]
 mod demo;
 mod graph;
+mod importer;
 mod ui;
 mod worker;
 
