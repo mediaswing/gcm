@@ -823,7 +823,7 @@ fn context_menu(app: &mut App, response: &egui::Response, view: View, source: us
             return;
         }
 
-        for item in menu::for_object(app, view, source) {
+        for item in menu::context_items(app, view, source) {
             match item {
                 menu::Item::Separator => {
                     ui.separator();
@@ -845,9 +845,34 @@ fn context_menu(app: &mut App, response: &egui::Response, view: View, source: us
                         ui.close();
                     }
                 }
+                // Never gated: none of these touch the tenant, and greying
+                // them out while read-only is what left views like Licenses
+                // and the logs with a menu that did nothing at all.
+                menu::Item::View {
+                    label,
+                    shortcut,
+                    command,
+                } => {
+                    if shortcut_button(ui, &label, shortcut) {
+                        let ctx = ui.ctx().clone();
+                        app.run_view_command(&ctx, command);
+                        ui.close();
+                    }
+                }
             }
         }
     });
+}
+
+/// A menu entry with its accelerator set out to the right, the way a native
+/// menu names one. These entries all had shortcuts long before they had a
+/// visible home, so the menu doubles as the place they are discovered.
+fn shortcut_button(ui: &mut egui::Ui, label: &str, shortcut: &str) -> bool {
+    let response = ui.add(
+        egui::Button::new(label)
+            .shortcut_text(RichText::new(shortcut).small().color(theme::MUTED)),
+    );
+    response.clicked()
 }
 
 /// One row as plain values, for export.

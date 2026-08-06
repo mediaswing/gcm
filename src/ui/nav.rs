@@ -307,34 +307,22 @@ fn context_menu(app: &mut App, response: &egui::Response, view: View) {
         .show(|ui| {
             ui.set_min_width(170.0);
 
-            match view {
-                View::Users => {
-                    if ui
-                        .add_enabled(armed, egui::Button::new("New user…"))
-                        .on_disabled_hover_text(
-                            "Enable write mode (Ctrl+Shift+W) to create an account",
-                        )
-                        .clicked()
-                    {
-                        app.new_user();
-                        ui.close();
+            // One source for what a node can create, shared with the toolbar,
+            // so the tree and the button cannot come to disagree about which
+            // nodes offer what.
+            if let Some((label, disabled_hover)) = super::menu::creatable(view) {
+                let clicked = ui
+                    .add_enabled(armed, egui::Button::new(label))
+                    .on_disabled_hover_text(disabled_hover)
+                    .clicked();
+                if clicked {
+                    match view {
+                        View::Groups => app.new_group(),
+                        _ => app.new_user(),
                     }
-                    ui.separator();
+                    ui.close();
                 }
-                View::Groups => {
-                    if ui
-                        .add_enabled(armed, egui::Button::new("New group…"))
-                        .on_disabled_hover_text(
-                            "Enable write mode (Ctrl+Shift+W) to create a group",
-                        )
-                        .clicked()
-                    {
-                        app.new_group();
-                        ui.close();
-                    }
-                    ui.separator();
-                }
-                _ => {}
+                ui.separator();
             }
 
             let refresh_label = if view == View::Overview {
@@ -345,6 +333,25 @@ fn context_menu(app: &mut App, response: &egui::Response, view: View) {
             if ui.button(refresh_label).clicked() {
                 app.refresh_view(view);
                 ui.close();
+            }
+
+            // Export belongs on every node that holds a list. It is the one
+            // thing worth doing with the read-only collections, and it was
+            // reachable only from the keyboard.
+            if view != View::Overview {
+                let exportable = app.store.count(view).is_some_and(|rows| rows > 0);
+                if ui
+                    .add_enabled(exportable, egui::Button::new("Export…"))
+                    .on_disabled_hover_text("There is nothing loaded here to export")
+                    .clicked()
+                {
+                    // Move to the node first: the export writes whatever the
+                    // current view holds, and exporting the previous node's
+                    // rows from this one's menu would be a quiet mis-fire.
+                    app.go_to(view);
+                    app.export(super::export::Format::Csv);
+                    ui.close();
+                }
             }
         });
 }

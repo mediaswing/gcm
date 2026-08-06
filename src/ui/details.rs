@@ -50,6 +50,11 @@ fn action_bar(app: &mut App, ui: &mut egui::Ui, source: usize) {
                         app.open_form(form.build());
                     }
                 }
+                // The bar draws tenant actions only. Copy, Export and Refresh
+                // reach this pane through its own Copy button, the toolbar and
+                // the right-click menu; a fourth copy of them here would just
+                // crowd out the buttons somebody came for.
+                menu::Item::View { .. } => {}
             }
         }
     });

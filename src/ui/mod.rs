@@ -1621,6 +1621,33 @@ impl App {
         self.palette = Some(palette);
     }
 
+    /// Run one of the console's own commands — the entries that need no write
+    /// mode and, until now, had only a keyboard shortcut.
+    ///
+    /// Each arm does exactly what the corresponding key does, by calling the
+    /// same method, so the menu cannot come to mean something different from
+    /// the accelerator printed beside it.
+    fn run_view_command(&mut self, ctx: &egui::Context, command: menu::ViewCommand) {
+        let view = self.view;
+        match command {
+            menu::ViewCommand::CopyRow => {
+                let text = details::copy_text(self);
+                if !text.is_empty() {
+                    ctx.copy_text(text);
+                    self.status = "Copied to clipboard".into();
+                }
+            }
+            menu::ViewCommand::ToggleMark => self.view_state(view).toggle_mark(),
+            menu::ViewCommand::MarkAllFiltered => {
+                self.view_state(view).mark_all_filtered()
+            }
+            menu::ViewCommand::ClearMarks => self.view_state(view).clear_marks(),
+            menu::ViewCommand::ExportCsv => self.export(export::Format::Csv),
+            menu::ViewCommand::ExportJson => self.export(export::Format::Json),
+            menu::ViewCommand::Refresh => self.refresh_current(),
+        }
+    }
+
     /// Open the create-user form, and move to the Users node so the new account
     /// is visible in the list the moment it is created.
     fn new_user(&mut self) {
@@ -1647,10 +1674,18 @@ impl App {
     /// `Ctrl+N` and the toolbar button share this: a group while looking at
     /// the Groups pane, a user everywhere else.
     fn new_user_or_group(&mut self) {
-        if self.view == View::Groups {
-            self.new_group();
-        } else {
-            self.new_user();
+        match self.view {
+            View::Groups => self.new_group(),
+            View::Users => self.new_user(),
+            // Ctrl+N from a node where nothing can be created used to open the
+            // create-user form and jump to Users, which is a surprising place
+            // to end up from the Licenses pane.
+            other => {
+                self.status = format!(
+                    "Nothing can be created from {} — go to Users or Groups",
+                    other.title()
+                )
+            }
         }
     }
 
@@ -1781,6 +1816,7 @@ impl App {
             match menu::palette(ctx, &mut palette, self.write_mode.is_armed()) {
                 menu::Chosen::Act(actions) => self.request_actions(actions),
                 menu::Chosen::Open(form) => self.open_form(form.build()),
+                menu::Chosen::View(command) => self.run_view_command(ctx, command),
                 menu::Chosen::Cancelled => {}
                 menu::Chosen::Pending => self.palette = Some(palette),
             }
@@ -1893,35 +1929,54 @@ impl App {
 
                 ui.separator();
 
-                // Always present rather than only on the Users node: creating
-                // an account or a group is an errand somebody arrives with,
-                // not something they navigate to first. It defaults to a user
-                // everywhere except the Groups pane, where a group is what
-                // whoever is looking at that list is more likely to want.
-                let creating_group = self.view == View::Groups;
-                let (new_label, new_hover, new_disabled_hover) = if creating_group {
-                    (
-                        "New group…",
-                        "Create a group (Ctrl+N)",
-                        "Enable write mode (Ctrl+Shift+W) to create a group",
-                    )
-                } else {
-                    (
-                        "New user…",
-                        "Create a user account (Ctrl+N)",
-                        "Enable write mode (Ctrl+Shift+W) to create an account",
-                    )
-                };
-                if ui
-                    .add_enabled(
-                        self.write_mode.is_armed(),
-                        egui::Button::new(new_label),
-                    )
-                    .on_hover_text(new_hover)
-                    .on_disabled_hover_text(new_disabled_hover)
-                    .clicked()
-                {
-                    self.new_user_or_group();
+                // Follows the node rather than sitting there offering "New
+                // user…" from the Licenses pane. Only two things in the console
+                // can be created, so on the other nine nodes the button is
+                // simply absent — a button that names the wrong object is worse
+                // than no button, because it reads as the one thing this pane
+                // can do.
+                // One slot, filled by whatever this node's primary action is,
+                // rather than a button per possibility. "New user…" used to sit
+                // here on all eleven nodes, naming the wrong object on nine of
+                // them; now it appears only where something can actually be
+                // created, and the read-only nodes get the thing that *is*
+                // useful there instead. One slot also keeps the row from
+                // growing wide enough to collide with the account controls
+                // pinned to the right.
+                match menu::creatable(self.view) {
+                    Some((new_label, new_disabled_hover)) => {
+                        if ui
+                            .add_enabled(
+                                self.write_mode.is_armed(),
+                                egui::Button::new(new_label),
+                            )
+                            .on_hover_text(format!(
+                                "{} (Ctrl+N)",
+                                new_label.trim_end_matches('…')
+                            ))
+                            .on_disabled_hover_text(new_disabled_hover)
+                            .clicked()
+                        {
+                            self.new_user_or_group();
+                        }
+                    }
+                    None if self.view != View::Overview => {
+                        let exportable =
+                            self.store.count(self.view).is_some_and(|rows| rows > 0);
+                        if ui
+                            .add_enabled(exportable, egui::Button::new("Export…"))
+                            .on_hover_text(
+                                "Export this view (Ctrl+E for CSV, Ctrl+Shift+E for JSON)",
+                            )
+                            .on_disabled_hover_text(
+                                "There is nothing loaded in this view to export",
+                            )
+                            .clicked()
+                        {
+                            self.export(export::Format::Csv);
+                        }
+                    }
+                    None => {}
                 }
 
                 // Only when there is somewhere to export to. A button that
@@ -1999,7 +2054,129 @@ impl App {
                     }
                 });
             });
+            self.object_bar(ui);
             ui.add_space(3.0);
+        });
+    }
+
+    /// A second toolbar row carrying what can be done to the selected object.
+    ///
+    /// Drawn from [`menu::for_object`], the same source as the right-click menu
+    /// and the details-pane button bar, so a console with three ways to reach an
+    /// action cannot offer three different sets of them.
+    ///
+    /// Absent entirely when there is nothing to show — on a view whose objects
+    /// Graph will not let anyone change, or with no row selected — rather than
+    /// an empty strip of chrome. It appears and disappears with the selection,
+    /// which is the price of not lying about what is available.
+    fn object_bar(&mut self, ui: &mut egui::Ui) {
+        let view = self.view;
+        let Some(source) = self.views.get(&view).and_then(|s| s.selected_source()) else {
+            return;
+        };
+
+        // Bulk takes precedence: with rows ticked, the toolbar should act on
+        // the ticked set, exactly as the right-click menu does.
+        let marked: Vec<usize> = self
+            .views
+            .get(&view)
+            .map(|state| state.marked.iter().copied().collect())
+            .unwrap_or_default();
+
+        let armed = self.write_mode.is_armed();
+
+        if marked.len() > 1 {
+            let bulk = menu::bulk_for(self, view, &marked);
+            if bulk.is_empty() {
+                return;
+            }
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{} selected", marked.len()))
+                        .small()
+                        .color(theme::MUTED),
+                );
+                ui.separator();
+                for (label, actions) in bulk {
+                    let destructive = actions
+                        .iter()
+                        .any(|action| action.severity() == Severity::Destructive);
+                    let text = if destructive {
+                        RichText::new(&label)
+                            .color(if armed { theme::BAD } else { theme::MUTED })
+                    } else {
+                        RichText::new(&label)
+                    };
+                    if ui
+                        .add_enabled(armed, egui::Button::new(text))
+                        .on_disabled_hover_text(
+                            "Enable write mode (Ctrl+Shift+W) to use this",
+                        )
+                        .clicked()
+                    {
+                        self.request_actions(actions);
+                    }
+                }
+            });
+            return;
+        }
+
+        // Creating an object is not something you do *to* the selected one,
+        // and the slot above already offers it — without this the toolbar
+        // showed "New user…" twice, one line apart.
+        let items: Vec<menu::Item> = menu::for_object(self, view, source)
+            .into_iter()
+            .filter(|item| !item.creates_object())
+            .collect();
+        if items.iter().all(|item| matches!(item, menu::Item::Separator)) {
+            return;
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(list::row_name(self, view, source))
+                    .small()
+                    .color(theme::MUTED),
+            );
+            ui.separator();
+            for item in items {
+                match item {
+                    menu::Item::Separator => {}
+                    menu::Item::Act { label, action } => {
+                        let destructive = action.severity() == Severity::Destructive;
+                        let text = if destructive {
+                            RichText::new(&label)
+                                .color(if armed { theme::BAD } else { theme::MUTED })
+                        } else {
+                            RichText::new(&label)
+                        };
+                        if ui
+                            .add_enabled(armed, egui::Button::new(text))
+                            .on_disabled_hover_text(
+                                "Enable write mode (Ctrl+Shift+W) to use this",
+                            )
+                            .clicked()
+                        {
+                            self.request_action(action);
+                        }
+                    }
+                    menu::Item::Open { label, form } => {
+                        if ui
+                            .add_enabled(armed, egui::Button::new(&label))
+                            .on_disabled_hover_text(
+                                "Enable write mode (Ctrl+Shift+W) to use this",
+                            )
+                            .clicked()
+                        {
+                            self.open_form(form.build());
+                        }
+                    }
+                    // The console's own commands already have toolbar buttons
+                    // of their own further up; `for_object` does not carry them
+                    // anyway, and this arm exists only to stay exhaustive.
+                    menu::Item::View { .. } => {}
+                }
+            }
         });
     }
 
