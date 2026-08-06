@@ -15,6 +15,11 @@ eframe = "0.35.0"
 egui = "0.35.0"
 egui_extras = { version = "0.35.0", default-features = false }
 getrandom = "0.4.3"
+# On-premises Active Directory. rustls-ring for the same reason as mysql_async
+# below — one TLS stack in the binary, not three. This feature also brings in
+# rustls-native-certs, which is what lets LDAPS validate against an internal
+# enterprise CA from the OS trust store rather than webpki's public roots.
+ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }
 # The MariaDB export. rustls rather than the default native-tls, so the whole
 # binary has one TLS stack — the same one reqwest already links — instead of
 # also dragging in OpenSSL or Schannel.
@@ -22,6 +27,12 @@ mysql_async = { version = "0.37.0", default-features = false, features = ["defau
 open = "5.4.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "charset", "http2", "query", "form", "gzip", "system-proxy"] }
 rfd = "0.17.2"
+# Not used for TLS directly. ldap3 builds its client config with
+# `ClientConfig::builder()`, which reads a process-wide crypto provider it never
+# installs — so gcm installs one itself before the first bind, or the first
+# LDAPS connection panics. Same crate and version reqwest already links, so this
+# compiles no additional code. See src/ldap/mod.rs.
+rustls = { version = "0.23.43", default-features = false, features = ["ring"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"

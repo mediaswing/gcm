@@ -56,6 +56,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// would be one `{:?}` away from putting a database password in the error log,
 /// which is precisely the file people email to other people. The manual `Debug`
 /// makes that impossible rather than merely unlikely.
+///
+/// Declared here because the database export needed it first, but it belongs to
+/// no one caller: [`crate::ldap`] carries the directory bind password in the
+/// same type, for the same reason and with the same guarantee.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Secret(String);
 

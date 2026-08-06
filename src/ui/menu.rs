@@ -260,9 +260,17 @@ pub fn for_object(app: &App, view: View, source: usize) -> Vec<Item> {
         //
         // The logs are read-only in a stronger sense — there is nothing in
         // Graph that could change a past sign-in, and there should not be.
-        View::Roles | View::Licenses | View::Overview | View::SignIns | View::AuditLogs => {
-            Vec::new()
-        }
+        //
+        // The on-premises views are read-only in the strongest sense of all:
+        // this release binds to the DC for reads and never asks it to change
+        // anything, so there is no AD action to offer here.
+        View::Roles
+        | View::Licenses
+        | View::Overview
+        | View::SignIns
+        | View::AuditLogs
+        | View::AdUsers
+        | View::AdComputers => Vec::new(),
     }
 }
 
@@ -787,13 +795,16 @@ pub fn bulk_for(app: &App, view: View, marked: &[usize]) -> Vec<(String, Vec<Act
 
         // Mailboxes carry one action, and applying the same out-of-office
         // message to a ticked set of people is not something anybody wants.
-        // The logs, roles and licences have nothing to act on at all.
+        // The logs, roles and licences have nothing to act on at all, and the
+        // on-premises views are read-only in this release.
         View::Mailboxes
         | View::Roles
         | View::Licenses
         | View::Overview
         | View::SignIns
-        | View::AuditLogs => {}
+        | View::AuditLogs
+        | View::AdUsers
+        | View::AdComputers => {}
     }
 
     out

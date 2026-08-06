@@ -108,6 +108,33 @@ pub fn entries(expanded: &HashSet<&'static str>) -> Vec<Entry> {
         });
     }
 
+    // The on-premises directory goes last, after everything the tenant itself
+    // provides, under its own parent rather than beside Users and Devices.
+    // Both halves of a hybrid estate answer "who is this person?", but they
+    // answer it about different objects with different identifiers, and
+    // merging the nodes would invite reading one list as the other. The Users
+    // pane is where the two are actually joined up.
+    //
+    // Last also because `keys::JUMP_KEYS` promises that Ctrl+0 to Ctrl+9 are
+    // positions in this tree. Inserting a node above Monitoring would shift
+    // Monitoring to position eleven while Ctrl+9 went on selecting it, quietly
+    // making that promise false.
+    entries.push(Entry {
+        label: "Directory",
+        view: View::AdUsers,
+        depth: 1,
+        expandable: Some("directory"),
+    });
+
+    if expanded.contains("directory") {
+        entries.push(Entry {
+            label: "AD Computers",
+            view: View::AdComputers,
+            depth: 2,
+            expandable: None,
+        });
+    }
+
     entries
 }
 
@@ -121,6 +148,7 @@ pub fn parent_of(view: View) -> Option<&'static str> {
     match view {
         View::Roles => Some("groups"),
         View::ManagedDevices => Some("devices"),
+        View::AdComputers => Some("directory"),
         View::AuditLogs => Some("monitoring"),
         _ => None,
     }
@@ -445,7 +473,7 @@ mod tests {
     }
 
     /// Every parent key the tree knows about.
-    const ALL_PARENTS: &[&str] = &["groups", "devices", "monitoring"];
+    const ALL_PARENTS: &[&str] = &["groups", "devices", "directory", "monitoring"];
 
     #[test]
     fn collapsed_tree_hides_children() {
@@ -462,6 +490,7 @@ mod tests {
                 "Exchange",
                 "Teams",
                 "Monitoring",
+                "Directory",
             ]
         );
     }
@@ -484,6 +513,8 @@ mod tests {
                 "Teams",
                 "Monitoring",
                 "Audit Logs",
+                "Directory",
+                "AD Computers",
             ]
         );
     }
@@ -496,10 +527,27 @@ mod tests {
         assert_eq!(index_of(&expanded(&[]), View::AuditLogs), None);
     }
 
+    /// `keys::JUMP_KEYS` documents Ctrl+0..9 as *positions* in this tree, which
+    /// is only true for as long as the first ten rows stay where they are.
+    /// Inserting a node above Monitoring silently broke this once already.
+    #[test]
+    fn the_jump_keys_still_line_up_with_the_first_ten_rows() {
+        let tree = entries(&expanded(ALL_PARENTS));
+        for (index, (_, view)) in super::super::keys::JUMP_KEYS.iter().enumerate() {
+            assert_eq!(
+                tree[index].view, *view,
+                "Ctrl+{index} selects {view:?}, but position {index} in the tree is {} \
+                 — either the tree moved or the shortcut did",
+                tree[index].label
+            );
+        }
+    }
+
     #[test]
     fn children_know_their_parent() {
         assert_eq!(parent_of(View::Roles), Some("groups"));
         assert_eq!(parent_of(View::ManagedDevices), Some("devices"));
+        assert_eq!(parent_of(View::AdComputers), Some("directory"));
         assert_eq!(parent_of(View::AuditLogs), Some("monitoring"));
         assert_eq!(parent_of(View::Users), None);
     }
@@ -518,6 +566,8 @@ mod tests {
             View::Teams,
             View::SignIns,
             View::AuditLogs,
+            View::AdUsers,
+            View::AdComputers,
         ] {
             assert!(
                 tree.iter().any(|e| e.view == view),

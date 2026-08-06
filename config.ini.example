@@ -26,6 +26,20 @@ tenant = "TENANT_ID_HERE"
 page_size = 999
 max_objects = 0
 
+; Optional. An on-premises Active Directory to read alongside the tenant. Adds
+; the Directory node to the console, and fills in the on-premises half of each
+; synced user's details.
+;
+; No password here: gcm asks for the bind password when you first open an AD
+; view and keeps it in memory only. A read-only account is enough.
+; [directory]
+; host = "dc01.corp.contoso.com"
+; port = 636
+; base_dn = "DC=corp,DC=contoso,DC=com"
+; bind_dn = "CORP\\svc-gcm"
+; tls = true
+; start_tls = false
+
 ; Sovereign clouds only — omit this section for worldwide commercial M365.
 ; [cloud]
 ; authority = "https://login.microsoftonline.us"

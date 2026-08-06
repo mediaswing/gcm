@@ -109,8 +109,10 @@ pub fn status_color(text: &str) -> Color32 {
     match text {
         "Enabled" | "Compliant" | "Yes" | "Success" | "Active" | "On" => OK,
         "In grace period" | "Unknown" | "Conflict" | "Timeout" | "Archived"
-        | "Scheduled" => WARN,
-        "Disabled" | "Not compliant" | "Error" | "Failure" => BAD,
+        | "Scheduled" | "Expired" => WARN,
+        // "Locked out" is red rather than amber: unlike an expired account it
+        // is usually happening right now, to somebody who is on the phone.
+        "Disabled" | "Not compliant" | "Error" | "Failure" | "Locked out" => BAD,
         _ => MUTED,
     }
 }

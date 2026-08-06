@@ -111,6 +111,124 @@ pub struct Config {
     /// Where the database export writes. Absent when the feature is not used,
     /// which is the normal case.
     pub mariadb: Option<MariaDb>,
+    /// The on-premises domain controller to read. Absent in a cloud-only
+    /// tenant, which is the normal case.
+    pub directory: Option<Directory>,
+}
+
+/// Connection details for an on-premises Active Directory domain controller.
+///
+/// No password, for the same reason [`MariaDb`] has none: this file is meant to
+/// stay pasteable into a support ticket. The bind password is asked for once
+/// per session and held in memory as a [`crate::mariadb::Secret`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct Directory {
+    /// Hostname of a domain controller, or of the domain itself where DNS
+    /// round-robins to one. Not discovered via SRV records: gcm would need a
+    /// DNS resolver of its own to do that, and an explicit name is also the
+    /// only way to pin reads to a particular DC.
+    pub host: String,
+    #[serde(default = "default_ldaps_port")]
+    pub port: u16,
+    /// Where subtree searches start — usually the domain naming context,
+    /// `DC=corp,DC=contoso,DC=com`. Narrow it to an OU to read only part of
+    /// the domain.
+    pub base_dn: String,
+    /// Who to bind as. Accepts any form the DC does: a full DN, `DOMAIN\user`,
+    /// or a UPN. A read-only account is enough for everything gcm does here.
+    pub bind_dn: String,
+    /// Use LDAPS. On by default, and off is a genuinely bad idea: a simple bind
+    /// puts the password on the wire in the clear.
+    #[serde(default = "default_true")]
+    pub tls: bool,
+    /// Negotiate StartTLS on the plain LDAP port instead of connecting to the
+    /// LDAPS port. Some domains publish only 389.
+    #[serde(default)]
+    pub start_tls: bool,
+}
+
+/// The LDAPS port. Deliberately not 389 — the default should be the encrypted
+/// one, so that reaching the insecure port takes a deliberate edit.
+fn default_ldaps_port() -> u16 {
+    636
+}
+
+impl Directory {
+    /// The URL `ldap3` connects to.
+    ///
+    /// StartTLS begins as a plain `ldap://` connection and is upgraded in
+    /// place, so it uses the same scheme as no TLS at all — the difference is
+    /// carried in the connection settings, not the URL.
+    pub fn url(&self) -> String {
+        let scheme = if self.tls && !self.start_tls {
+            "ldaps"
+        } else {
+            "ldap"
+        };
+        format!("{scheme}://{}:{}", self.host, self.port)
+    }
+
+    /// The connection as it is safe to print. There is no password on this
+    /// struct to leak, but the same accessor exists on [`MariaDb`] and the
+    /// dialogs use them interchangeably.
+    pub fn describe(&self) -> String {
+        format!("{}@{}:{}", self.bind_dn, self.host, self.port)
+    }
+
+    /// How the connection is secured, for the bind dialog to say out loud.
+    pub fn transport(&self) -> &'static str {
+        match (self.tls, self.start_tls) {
+            (true, true) => "StartTLS",
+            (true, false) => "LDAPS",
+            (false, _) => "unencrypted",
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        let path = config_path();
+        if self.host.trim().is_empty() {
+            bail!("`host` is not set in the [directory] section of {}", path.display());
+        }
+        if self.bind_dn.trim().is_empty() {
+            bail!(
+                "`bind_dn` is not set in the [directory] section of {}",
+                path.display()
+            );
+        }
+        // A subtree search from an empty base is a search of the whole
+        // directory including the configuration and schema partitions, which is
+        // never what was meant and is slow enough to look like a hang.
+        if self.base_dn.trim().is_empty() {
+            bail!(
+                "`base_dn` is not set in the [directory] section of {} — it is what \
+                 bounds the search, and an empty one reads the entire forest",
+                path.display()
+            );
+        }
+        // StartTLS *is* TLS — it is how you get it on port 389. Accepting this
+        // combination would connect in the clear and send the bind password
+        // with it, while the configuration reads as though TLS was asked for.
+        // Refused rather than silently resolved either way.
+        if self.start_tls && !self.tls {
+            bail!(
+                "`start_tls` is on but `tls` is off in the [directory] section of {} — \
+                 StartTLS is how TLS is negotiated on the plain port, so this would \
+                 connect unencrypted while appearing not to. Set tls = true, or turn \
+                 start_tls off as well.",
+                path.display()
+            );
+        }
+        if !self.base_dn.to_ascii_uppercase().contains("DC=")
+            && !self.base_dn.to_ascii_uppercase().contains("OU=")
+        {
+            bail!(
+                "`base_dn` in the [directory] section of {} does not look like a \
+                 distinguished name — it should read like DC=corp,DC=contoso,DC=com",
+                path.display()
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Connection details for the MariaDB export.
@@ -327,6 +445,16 @@ impl Config {
         self.query.page_size.clamp(1, 999)
     }
 
+    /// Page size for LDAP searches.
+    ///
+    /// Clamped to 1000 rather than Graph's 999 because that is Active
+    /// Directory's own `MaxPageSize`, and unlike Graph a DC silently caps an
+    /// oversized request rather than refusing it — so asking for more would
+    /// look like it worked while quietly doing something else.
+    pub fn ldap_page_size(&self) -> i32 {
+        self.query.page_size.clamp(1, 1000) as i32
+    }
+
     /// How far back the log views reach. Entra keeps at most 30 days of
     /// sign-ins without a P2 licence, so asking for more just returns less.
     pub fn log_days(&self) -> u32 {
@@ -354,6 +482,9 @@ impl Config {
         }
         if let Some(mariadb) = &self.mariadb {
             mariadb.validate()?;
+        }
+        if let Some(directory) = &self.directory {
+            directory.validate()?;
         }
         Ok(())
     }
@@ -440,6 +571,26 @@ log_records = 500
 ; table_prefix = "gcm_"
 ; require_tls = true
 
+; Optional. Uncomment to read an on-premises Active Directory alongside the
+; tenant, which adds the Directory node to the console and fills in the
+; on-premises half of each synced user's details.
+;
+; No password here either, for the same reason as above. gcm asks for the bind
+; password when you first open an AD view and keeps it only in memory. A
+; read-only account is sufficient; nothing in this release writes to AD.
+;
+; tls = true uses LDAPS on port 636. Set start_tls = true instead to negotiate
+; TLS on port 389 where that is all the domain publishes. Turning tls off puts
+; the bind password on the wire in the clear.
+;
+; [directory]
+; host = "dc01.corp.contoso.com"
+; port = 636
+; base_dn = "DC=corp,DC=contoso,DC=com"
+; bind_dn = "CORP\\svc-gcm"
+; tls = true
+; start_tls = false
+
 ; Sovereign clouds only — omit this section for worldwide commercial M365.
 ; [cloud]
 ; authority = "https://login.microsoftonline.us"
@@ -511,6 +662,82 @@ fn write_template(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn directory(tls: bool, start_tls: bool) -> Directory {
+        Directory {
+            host: "dc01.corp.contoso.com".into(),
+            port: 636,
+            base_dn: "DC=corp,DC=contoso,DC=com".into(),
+            bind_dn: "CORP\\svc-gcm".into(),
+            tls,
+            start_tls,
+        }
+    }
+
+    #[test]
+    fn start_tls_without_tls_is_refused_rather_than_resolved() {
+        // The dangerous case: it reads as though TLS was asked for, and would
+        // have put the bind password on the wire in the clear.
+        let err = directory(false, true)
+            .validate()
+            .expect_err("the contradiction must not be accepted");
+        let message = format!("{err:#}");
+        assert!(message.contains("start_tls"), "got: {message}");
+        assert!(message.contains("unencrypted"), "got: {message}");
+
+        // The three coherent combinations all stand.
+        directory(true, false).validate().expect("LDAPS");
+        directory(true, true).validate().expect("StartTLS");
+        directory(false, false).validate().expect("deliberately plaintext");
+    }
+
+    #[test]
+    fn a_base_dn_that_is_not_a_dn_is_refused() {
+        // An empty base searches the entire forest including the schema and
+        // configuration partitions, which looks like a hang.
+        let mut settings = directory(true, false);
+        settings.base_dn = String::new();
+        assert!(settings.validate().is_err(), "an empty base must be refused");
+
+        settings.base_dn = "corp.contoso.com".into();
+        assert!(
+            settings.validate().is_err(),
+            "a domain name is not a distinguished name"
+        );
+    }
+
+    #[test]
+    fn the_ldap_page_size_clamps_to_active_directorys_own_limit() {
+        // AD's MaxPageSize defaults to 1000 and silently caps anything larger
+        // rather than refusing it, so asking for more would look like it worked.
+        let raw = r#"
+[application]
+client = "abc"
+tenant = "contoso.onmicrosoft.com"
+
+[query]
+page_size = 5000
+"#;
+        let config: Config = parse(raw).expect("should parse");
+        assert_eq!(config.ldap_page_size(), 1000);
+        // And Graph's own ceiling is unchanged at 999.
+        assert_eq!(config.page_size(), 999);
+    }
+
+    #[test]
+    fn the_directory_section_is_optional() {
+        let raw = r#"
+[application]
+client = "abc"
+tenant = "contoso.onmicrosoft.com"
+"#;
+        let config: Config = parse(raw).expect("should parse");
+        assert!(
+            config.directory.is_none(),
+            "a cloud-only tenant is the normal case"
+        );
+        config.validate().expect("no [directory] is perfectly valid");
+    }
 
     #[test]
     fn parses_the_minimal_ini_shape() {
