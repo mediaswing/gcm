@@ -370,7 +370,11 @@ async fn run<F: Fn() + Send + 'static>(
                 }
             }
             Command::SignOut => {
-                crate::auth::clear_cache();
+                // Through the authenticator rather than deleting the cache file
+                // behind its back: the tokens it holds in memory are what kept
+                // the session alive, and a Sign out that leaves the console able
+                // to read the tenant has not signed anybody out.
+                client.auth_mut().forget();
                 reporter.send(Event::SignedOut);
             }
             Command::LoadAll => load_all(&mut client, &reporter).await,
