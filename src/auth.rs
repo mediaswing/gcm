@@ -127,8 +127,12 @@ fn load_cache() -> Option<CachedToken> {
     serde_json::from_str(&raw).ok()
 }
 
-/// Forget the cached refresh token, forcing an interactive sign-in next time.
-pub fn clear_cache() {
+/// Delete the cached refresh token.
+///
+/// Deliberately private. Signing out means [`Authenticator::forget`] — deleting
+/// this file alone leaves the tokens in memory intact and the session fully
+/// usable, which is exactly the bug that made Sign out appear to do nothing.
+fn clear_cache() {
     let _ = fs::remove_file(cache_path());
 }
 
@@ -432,6 +436,13 @@ pub struct Authenticator {
     /// Whether the tenant granted the write scopes. False means the console
     /// runs read-only and write mode cannot be armed at all.
     writes_available: bool,
+    /// Set by [`Self::forget`], and the reason Sign out is worth pressing.
+    ///
+    /// Without it Entra re-issues silently from the browser's own session
+    /// cookie: the redirect completes before anyone can read it, and the
+    /// operator lands back in the same account having apparently done nothing.
+    /// See [`Self::auth_code_flow`].
+    force_account_picker: bool,
 }
 
 impl Authenticator {
@@ -441,7 +452,28 @@ impl Authenticator {
             http,
             token: None,
             writes_available: true,
+            force_account_picker: false,
         }
+    }
+
+    /// Forget the signed-in identity completely, and ask who they are next time.
+    ///
+    /// Three things, all of which Sign out needs and only the first of which it
+    /// used to do:
+    ///
+    /// * the refresh token cached on disk, so a later launch does not resume;
+    /// * the tokens held **in memory**, without which the console kept a fully
+    ///   working session — every read still succeeded, and a cancelled or
+    ///   failed re-sign-in left it that way;
+    /// * a flag asking Entra for the account picker, because otherwise the
+    ///   browser's existing session signs the same person straight back in.
+    pub fn forget(&mut self) {
+        clear_cache();
+        self.token = None;
+        // The next sign-in decides this afresh; carrying the old answer over
+        // would let a read-only session poison a subsequent privileged one.
+        self.writes_available = true;
+        self.force_account_picker = true;
     }
 
     /// Whether this session may attempt writes at all.
@@ -490,6 +522,7 @@ impl Authenticator {
             Ok(token) => {
                 save_cache(&token);
                 self.token = Some(token);
+                self.force_account_picker = false;
                 Ok(())
             }
             Err(err) if is_permission_refusal(&format!("{err:#}")) => {
@@ -500,10 +533,50 @@ impl Authenticator {
                 )?;
                 save_cache(&token);
                 self.token = Some(token);
+                self.force_account_picker = false;
                 Ok(())
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// Build the authorize URL.
+    ///
+    /// Split out from the flow because the one thing here that is easy to get
+    /// wrong — whether Entra is asked for the account picker — is otherwise
+    /// only observable by watching a browser.
+    fn authorize_url(
+        &self,
+        redirect_uri: &str,
+        challenge: &str,
+        state: &str,
+        include_writes: bool,
+    ) -> String {
+        let authority = self.config.authority_url();
+        format!(
+            "{authority}/oauth2/v2.0/authorize\
+             ?client_id={client_id}\
+             &response_type=code\
+             &redirect_uri={redirect}\
+             &response_mode=query\
+             &scope={scope}\
+             &state={state}\
+             &code_challenge={challenge}\
+             &code_challenge_method=S256{prompt}",
+            client_id = encode(self.config.client_id()),
+            redirect = encode(redirect_uri),
+            scope = encode(&scopes(include_writes)),
+            state = encode(state),
+            challenge = encode(challenge),
+            // Only after a deliberate sign-out. On a first run, or when a
+            // refresh token has simply expired, silent single sign-on is the
+            // desirable behaviour and prompting would be a regression.
+            prompt = if self.force_account_picker {
+                "&prompt=select_account"
+            } else {
+                ""
+            },
+        )
     }
 
     /// A currently-valid access token, refreshing transparently if needed.
@@ -562,22 +635,7 @@ impl Authenticator {
         let challenge = pkce_challenge(&verifier);
         let state = random_urlsafe(24);
 
-        let url = format!(
-            "{authority}/oauth2/v2.0/authorize\
-             ?client_id={client_id}\
-             &response_type=code\
-             &redirect_uri={redirect}\
-             &response_mode=query\
-             &scope={scope}\
-             &state={state}\
-             &code_challenge={challenge}\
-             &code_challenge_method=S256",
-            client_id = encode(self.config.client_id()),
-            redirect = encode(&redirect_uri),
-            scope = encode(&scopes(include_writes)),
-            state = encode(&state),
-            challenge = encode(&challenge),
-        );
+        let url = self.authorize_url(&redirect_uri, &challenge, &state, include_writes);
 
         // Opening the browser can fail silently on a headless session, so the
         // URL is handed to the UI either way.
@@ -649,6 +707,71 @@ impl Authenticator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn authenticator() -> Authenticator {
+        let config = Config {
+            application: crate::config::Application {
+                client: "test-client".into(),
+                tenant: "contoso.onmicrosoft.com".into(),
+            },
+            cloud: Default::default(),
+            query: Default::default(),
+            mariadb: None,
+        };
+        Authenticator::new(config, reqwest::Client::new())
+    }
+
+    #[test]
+    fn an_ordinary_sign_in_does_not_force_the_account_picker() {
+        // Silent single sign-on is the right behaviour on a first run and after
+        // a refresh token simply expires; prompting there would be a
+        // regression, not a fix.
+        let auth = authenticator();
+        let url = auth.authorize_url("http://localhost:1234", "challenge", "state", true);
+        assert!(!url.contains("prompt="), "got: {url}");
+    }
+
+    #[test]
+    fn signing_out_forces_the_account_picker() {
+        // Without this Entra reissues from the browser's own session cookie and
+        // the operator lands back in the same account, which is precisely why
+        // Sign out looked like it did nothing.
+        let mut auth = authenticator();
+        auth.forget();
+        let url = auth.authorize_url("http://localhost:1234", "challenge", "state", true);
+        assert!(url.contains("&prompt=select_account"), "got: {url}");
+    }
+
+    #[test]
+    fn signing_out_drops_the_token_held_in_memory() {
+        // Deleting the cache file alone left a fully working session: every
+        // read still succeeded, and a cancelled re-sign-in left it that way.
+        let mut auth = authenticator();
+        auth.token = Some(Token {
+            access_token: "secret".into(),
+            refresh_token: Some("secret".into()),
+            expires_at: Utc::now() + ChronoDuration::hours(1),
+            account: Some("someone@contoso.co.uk".into()),
+            writes: true,
+        });
+        assert!(auth.account().is_some());
+
+        auth.forget();
+
+        assert!(auth.token.is_none(), "the in-memory token must not survive");
+        assert!(auth.account().is_none(), "the console must forget who it was");
+    }
+
+    #[test]
+    fn the_authorize_url_still_carries_pkce_and_state() {
+        // The prompt parameter is appended to the end of the format string, so
+        // this guards against it having eaten the parameter before it.
+        let url = authenticator().authorize_url("http://localhost:1234", "chal", "st", true);
+        assert!(url.contains("code_challenge=chal"), "got: {url}");
+        assert!(url.contains("code_challenge_method=S256"), "got: {url}");
+        assert!(url.contains("&state=st"), "got: {url}");
+        assert!(url.contains("response_type=code"), "got: {url}");
+    }
 
     #[test]
     fn decodes_base64url_without_padding() {
