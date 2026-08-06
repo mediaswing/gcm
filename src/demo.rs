@@ -14,6 +14,7 @@ use chrono::{Duration, Utc};
 
 use crate::graph::Fetch;
 use crate::graph::models::*;
+use crate::ldap::models::{AdComputer, AdUser, uac};
 
 pub fn enabled() -> bool {
     std::env::var("GCM_DEMO").is_ok_and(|value| value == "1")
@@ -688,6 +689,155 @@ pub fn audits() -> Fetch<Arc<Vec<DirectoryAudit>>> {
 /// hard to get right and easy to get wrong: whether the dialog names the right
 /// tables, counts the right rows, and says clearly enough that it is about to
 /// replace them.
+pub fn directory() -> crate::config::Directory {
+    crate::config::Directory {
+        host: "dc01.corp.contoso.co.uk".into(),
+        port: 636,
+        base_dn: "DC=corp,DC=contoso,DC=co,DC=uk".into(),
+        bind_dn: "CORP\\svc-gcm".into(),
+        tls: true,
+        start_tls: false,
+    }
+}
+
+/// Synthetic on-premises accounts.
+///
+/// Built to line up with [`users`]: every third demo user is marked as synced
+/// from AD and carries its alias as `onPremisesSamAccountName`, so the same
+/// aliases appear here and the correlation in the Users pane has something real
+/// to join against. Getting this wrong would make the join look broken when it
+/// was only the fixtures that disagreed.
+pub fn ad_users() -> Fetch<Arc<Vec<AdUser>>> {
+    if unavailable("GCM_DEMO_NO_DIRECTORY") {
+        return Fetch::Unavailable(
+            "No domain controller is configured, so there is no on-premises directory \
+             to read. Add a [directory] section to the configuration naming a DC, a \
+             base DN and a read-only bind account."
+                .into(),
+        );
+    }
+
+    // Name, alias, title, OU, userAccountControl. The flags are the point of
+    // the fixture: an ordinary account, one whose password never expires, one
+    // that is disabled on-premises while its cloud shadow is still enabled, and
+    // one with two of the weak-authentication bits set.
+    let people = [
+        ("Aisha Rahman", "aisha.rahman", "Finance Director", "Finance", uac::NORMAL_ACCOUNT),
+        (
+            "Dmitri Sokolov",
+            "dmitri.sokolov",
+            "Solutions Architect",
+            "IT",
+            uac::NORMAL_ACCOUNT | uac::DONT_EXPIRE_PASSWORD,
+        ),
+        (
+            "Grace Lin",
+            "grace.lin",
+            "Chief Technology Officer",
+            "Executive",
+            uac::NORMAL_ACCOUNT | uac::ACCOUNT_DISABLED,
+        ),
+        (
+            "Jonah Whitfield",
+            "jonah.whitfield",
+            "Sales Executive",
+            "Sales",
+            uac::NORMAL_ACCOUNT | uac::PASSWD_NOTREQD | uac::DONT_REQ_PREAUTH,
+        ),
+        // Present on-premises and nowhere in the tenant — a service account
+        // that was never synced, which is what most of a real domain looks
+        // like and what the AD view exists to show.
+        (
+            "SQL Service Account",
+            "svc-sql",
+            "Service account",
+            "Service Accounts",
+            uac::NORMAL_ACCOUNT | uac::DONT_EXPIRE_PASSWORD,
+        ),
+    ];
+
+    let users = people
+        .iter()
+        .enumerate()
+        .map(|(index, (name, alias, title, ou, flags))| AdUser {
+            dn: format!("CN={name},OU={ou},DC=corp,DC=contoso,DC=co,DC=uk"),
+            sam_account_name: Some((*alias).into()),
+            user_principal_name: Some(format!("{alias}@corp.contoso.co.uk")),
+            display_name: Some((*name).into()),
+            mail: Some(format!("{alias}@contoso.co.uk")),
+            title: Some((*title).into()),
+            department: Some((*ou).into()),
+            company: Some("Contoso Ltd".into()),
+            office: Some(if index % 2 == 0 { "London" } else { "Leeds" }.into()),
+            telephone: Some("+44 20 7946 0000".into()),
+            description: Some(format!("{title} — demo fixture")),
+            object_guid: Some(format!("8f3a91d2-0000-4c1a-9e77-ad00000000{index:02}")),
+            object_sid: Some(format!("S-1-5-21-1004336348-1177238915-682003330-{}", 1100 + index)),
+            user_account_control: Some(*flags),
+            pwd_last_set: ago(index as i64 * 40 + 12),
+            last_logon: ago(index as i64 * 3 + 1),
+            when_created: ago(1200 - index as i64 * 90),
+            when_changed: ago(index as i64 * 5),
+            // The last two are domain-local groups of the sort that never
+            // syncs, so the Users pane has something to list under
+            // "on-premises groups only".
+            member_of: vec![
+                format!("CN={ou} Team,OU=Groups,DC=corp,DC=contoso,DC=co,DC=uk"),
+                "CN=VPN Users,OU=Groups,DC=corp,DC=contoso,DC=co,DC=uk".into(),
+                "CN=File Server Access,CN=Builtin,DC=corp,DC=contoso,DC=co,DC=uk".into(),
+            ],
+            ..Default::default()
+        })
+        .collect();
+
+    Fetch::Ready(Arc::new(users))
+}
+
+pub fn ad_computers() -> Fetch<Arc<Vec<AdComputer>>> {
+    if unavailable("GCM_DEMO_NO_DIRECTORY") {
+        return Fetch::Unavailable(
+            "No domain controller is configured, so there is no on-premises directory \
+             to read."
+                .into(),
+        );
+    }
+
+    let specs = [
+        ("LON-DC-0001", "Windows Server 2022 Standard", "10.0 (20348)", "Domain Controllers", uac::SERVER_TRUST),
+        ("LON-SRV-0001", "Windows Server 2022 Standard", "10.0 (20348)", "Servers", uac::WORKSTATION_TRUST),
+        ("LON-LT-0042", "Windows 11 Enterprise", "10.0 (22631)", "Workstations", uac::WORKSTATION_TRUST),
+        ("LDS-DT-0007", "Windows 11 Enterprise", "10.0 (26100)", "Workstations", uac::WORKSTATION_TRUST),
+        (
+            "LON-LT-0099",
+            "Windows 10 Enterprise",
+            "10.0 (19045)",
+            "Workstations",
+            uac::WORKSTATION_TRUST | uac::ACCOUNT_DISABLED,
+        ),
+    ];
+
+    let computers = specs
+        .iter()
+        .enumerate()
+        .map(|(index, (name, os, version, ou, flags))| AdComputer {
+            dn: format!("CN={name},OU={ou},DC=corp,DC=contoso,DC=co,DC=uk"),
+            name: Some((*name).into()),
+            sam_account_name: Some(format!("{name}$")),
+            dns_host_name: Some(format!("{}.corp.contoso.co.uk", name.to_lowercase())),
+            operating_system: Some((*os).into()),
+            operating_system_version: Some((*version).into()),
+            description: Some(format!("{ou} — demo fixture")),
+            object_guid: Some(format!("8f3a91d2-0000-4c1a-9e77-adc00000000{index}")),
+            user_account_control: Some(*flags),
+            last_logon: ago(index as i64 * 2 + 1),
+            when_created: ago(1000 - index as i64 * 120),
+            ..Default::default()
+        })
+        .collect();
+
+    Fetch::Ready(Arc::new(computers))
+}
+
 pub fn mariadb() -> crate::config::MariaDb {
     crate::config::MariaDb {
         host: "db.contoso.internal".into(),

@@ -43,6 +43,11 @@ pub fn unavailable(view: View) -> &'static str {
         View::Mailboxes => {
             "Exchange would rather not discuss its mailboxes"
         }
+        // Not a licence or a permission this time — almost always a tenant
+        // that simply has no domain to read, which is a fine way to live.
+        View::AdUsers | View::AdComputers => {
+            "There is no domain controller on the other end of this"
+        }
         // The remaining views come from the core directory. If those are
         // unavailable the sign-in itself has failed, and there is nothing
         // amusing about that.
@@ -81,6 +86,11 @@ pub fn remedy(view: View) -> &'static str {
         View::Mailboxes => {
             "This list comes from the mailbox usage report, so it needs \
              Reports.Read.All. Without it, Exchange is a rumour."
+        }
+        View::AdUsers | View::AdComputers => {
+            "Add a [directory] section to the configuration naming a domain \
+             controller, a base DN and a read-only bind account. If everything here \
+             was born in the cloud, there is nothing to add."
         }
         View::Overview
         | View::Users
@@ -122,27 +132,25 @@ pub fn nothing_to_do(what: &str) -> String {
 mod tests {
     use super::*;
 
-    const EVERY_VIEW: &[View] = &[
-        View::Overview,
-        View::Users,
-        View::Groups,
-        View::Roles,
-        View::Devices,
-        View::ManagedDevices,
-        View::Licenses,
-        View::Mailboxes,
-        View::Teams,
-        View::SignIns,
-        View::AuditLogs,
-    ];
+    /// Every view, derived from `View::ALL` rather than listed by hand.
+    ///
+    /// This list was previously written out, and went stale the moment a view
+    /// was added — which is the one failure mode these tests exist to catch,
+    /// since a view missing from the list is exactly a view whose message
+    /// nobody checked.
+    fn every_view() -> Vec<View> {
+        let mut views = vec![View::Overview];
+        views.extend_from_slice(View::ALL);
+        views
+    }
 
     #[test]
     fn every_view_has_both_halves_of_the_message() {
         // A headline without a remedy is a joke at the operator's expense,
         // which is the one thing this module must never ship.
-        for view in EVERY_VIEW {
-            assert!(!unavailable(*view).is_empty(), "{view:?} has no headline");
-            assert!(!remedy(*view).is_empty(), "{view:?} has no remedy");
+        for view in every_view() {
+            assert!(!unavailable(view).is_empty(), "{view:?} has no headline");
+            assert!(!remedy(view).is_empty(), "{view:?} has no remedy");
         }
     }
 
@@ -158,9 +166,10 @@ mod tests {
             "Check",
             "sign out",
             "licensed",
+            "Add",
         ];
-        for view in EVERY_VIEW {
-            let text = remedy(*view);
+        for view in every_view() {
+            let text = remedy(view);
             assert!(
                 ACTIONABLE.iter().any(|word| text.contains(word)),
                 "{view:?}'s remedy tells nobody what to do: {text}"

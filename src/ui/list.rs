@@ -12,6 +12,7 @@ use super::{App, Pane, View, menu, theme};
 use crate::graph::actions::Severity;
 use crate::graph::Fetch;
 use crate::graph::models::*;
+use crate::ldap::models::{AdComputer, AdUser};
 
 /// Width reserved at the left of every row for the bulk-selection tick.
 const MARK_GUTTER: f32 = 18.0;
@@ -112,6 +113,28 @@ const AUDIT_COLUMNS: &[Column] = &[
     col("Result", 1.0),
 ];
 
+// The AD views lead with the identifier that actually works on-premises. A
+// sAMAccountName is what a logon prompt, a file-server ACL and every existing
+// script take; the UPN is second because in a hybrid domain it is the column
+// that lines up with the Entra Users view beside it.
+const AD_USER_COLUMNS: &[Column] = &[
+    col("Name", 2.2),
+    col("SAM account", 1.4),
+    col("User principal name", 2.4),
+    col("Job title", 1.5),
+    col("Status", 1.1),
+    col("Organisational unit", 2.4),
+];
+
+const AD_COMPUTER_COLUMNS: &[Column] = &[
+    col("Name", 2.0),
+    col("DNS name", 2.4),
+    col("Operating system", 2.4),
+    col("Role", 1.3),
+    col("Status", 1.0),
+    col("Last logon", 1.4),
+];
+
 pub fn columns(view: View) -> &'static [Column] {
     match view {
         View::Overview => &[],
@@ -125,6 +148,8 @@ pub fn columns(view: View) -> &'static [Column] {
         View::Teams => TEAM_COLUMNS,
         View::SignIns => SIGN_IN_COLUMNS,
         View::AuditLogs => AUDIT_COLUMNS,
+        View::AdUsers => AD_USER_COLUMNS,
+        View::AdComputers => AD_COMPUTER_COLUMNS,
     }
 }
 
@@ -247,7 +272,37 @@ fn cell(app: &App, view: View, source: usize, column: usize) -> String {
             },
             None => String::new(),
         },
+        View::AdUsers => match ad_users(app).get(source) {
+            Some(user) => match column {
+                0 => user.name().to_string(),
+                1 => user.sam().to_string(),
+                2 => user.upn().to_string(),
+                3 => fmt_opt(&user.title),
+                4 => user.status().to_string(),
+                _ => user.ou(),
+            },
+            None => String::new(),
+        },
+        View::AdComputers => match ad_computers(app).get(source) {
+            Some(computer) => match column {
+                0 => computer.name().to_string(),
+                1 => fmt_opt(&computer.dns_host_name),
+                2 => computer.os_display(),
+                3 => computer.role().to_string(),
+                4 => computer.status().to_string(),
+                _ => fmt_date(&computer.last_logon),
+            },
+            None => String::new(),
+        },
     }
+}
+
+fn ad_users(app: &App) -> &[AdUser] {
+    ready(&app.store.ad_users)
+}
+
+fn ad_computers(app: &App) -> &[AdComputer] {
+    ready(&app.store.ad_computers)
 }
 
 fn managed(app: &App) -> &[ManagedDevice] {
@@ -296,6 +351,28 @@ pub fn user_matches(user: &User, needle: &str) -> bool {
         || contains(&user.job_title, needle)
         || contains(&user.department, needle)
         || contains(&user.office_location, needle)
+}
+
+/// The OU is searchable as well as the name, because "show me everyone in
+/// Finance" is an OU question on-premises and a department question in the
+/// cloud, and the operator should not have to remember which console they are
+/// looking at to type it.
+pub fn ad_user_matches(user: &AdUser, needle: &str) -> bool {
+    user.name().to_lowercase().contains(needle)
+        || contains(&user.sam_account_name, needle)
+        || contains(&user.user_principal_name, needle)
+        || contains(&user.mail, needle)
+        || contains(&user.title, needle)
+        || contains(&user.department, needle)
+        || user.ou().to_lowercase().contains(needle)
+}
+
+pub fn ad_computer_matches(computer: &AdComputer, needle: &str) -> bool {
+    computer.name().to_lowercase().contains(needle)
+        || contains(&computer.dns_host_name, needle)
+        || computer.os_display().to_lowercase().contains(needle)
+        || contains(&computer.description, needle)
+        || computer.ou().to_lowercase().contains(needle)
 }
 
 pub fn group_matches(group: &Group, needle: &str) -> bool {

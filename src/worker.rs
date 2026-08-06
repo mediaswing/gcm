@@ -19,6 +19,7 @@ use crate::config::Config;
 use crate::graph::actions::Action;
 use crate::graph::models::*;
 use crate::graph::{Fetch, GraphClient};
+use crate::ldap::models::{AdComputer, AdUser};
 
 /// Which collection a load request refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -33,9 +34,24 @@ pub enum Collection {
     AuditLogs,
     Teams,
     Mailboxes,
+    /// User accounts read from an on-premises domain controller over LDAP,
+    /// rather than from Graph. The distinction matters to the worker, which
+    /// serves them from a different client; it does not matter to the UI.
+    AdUsers,
+    AdComputers,
 }
 
 impl Collection {
+    /// True when this collection comes from a domain controller rather than
+    /// from Graph.
+    ///
+    /// The two differ in what a failure means and in what has to be held to
+    /// retry one: an AD read needs a bind password the worker deliberately does
+    /// not keep, so `LoadAll` cannot include these.
+    pub fn is_directory(self) -> bool {
+        matches!(self, Collection::AdUsers | Collection::AdComputers)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Collection::Users => "Users",
@@ -48,6 +64,8 @@ impl Collection {
             Collection::AuditLogs => "Audit logs",
             Collection::Teams => "Teams",
             Collection::Mailboxes => "Mailboxes",
+            Collection::AdUsers => "AD users",
+            Collection::AdComputers => "AD computers",
         }
     }
 }
@@ -95,6 +113,21 @@ pub enum Command {
         password: crate::mariadb::Secret,
         tables: Vec<crate::mariadb::Table>,
     },
+    /// Read an on-premises collection from the configured domain controller.
+    ///
+    /// Separate from [`Command::Load`] because it carries a credential. As with
+    /// the database export, the bind password travels with the request rather
+    /// than being held by the worker, so there is one copy of it in the process
+    /// and the UI decides how long it lives.
+    LoadDirectory {
+        collection: Collection,
+        password: crate::mariadb::Secret,
+    },
+    /// Check a bind DN and password against the domain controller without
+    /// reading anything, so a typo is reported by the dialog that caused it.
+    VerifyDirectoryBind {
+        password: crate::mariadb::Secret,
+    },
     /// Ask GitHub for a newer release. Sent once, at startup.
     CheckForUpdate,
     /// Download and apply the release, replacing the running install.
@@ -135,6 +168,16 @@ pub enum Event {
     AuditLogs(Fetch<Arc<Vec<DirectoryAudit>>>),
     Teams(Fetch<Arc<Vec<Team>>>),
     Mailboxes(Fetch<Arc<Vec<Mailbox>>>),
+    /// On-premises user accounts, or the reason there are none to show —
+    /// which for a cloud-only tenant is simply that no domain controller is
+    /// configured.
+    AdUsers(Fetch<Arc<Vec<AdUser>>>),
+    AdComputers(Fetch<Arc<Vec<AdComputer>>>),
+    /// The bind password was accepted by the domain controller. The UI keeps
+    /// it for the session on the strength of this.
+    DirectoryBound,
+    /// The bind was refused, with a reason to show against the password field.
+    DirectoryBindFailed(String),
     /// A team's full settings and channel list.
     TeamDetail {
         team_id: String,
@@ -312,6 +355,14 @@ impl<F: Fn()> Reporter<F> {
             Event::AuditLogs(Fetch::Unavailable(reason)) => errorlog::warn("audit-logs", reason),
             Event::Teams(Fetch::Unavailable(reason)) => errorlog::warn("teams", reason),
             Event::Mailboxes(Fetch::Unavailable(reason)) => errorlog::warn("mailboxes", reason),
+            Event::AdUsers(Fetch::Unavailable(reason))
+            | Event::AdComputers(Fetch::Unavailable(reason)) => {
+                errorlog::warn("directory", reason)
+            }
+            // Safe to log: `explain` in the LDAP client builds these out of the
+            // host, the bind DN and the result code, never out of the password.
+            Event::DirectoryBindFailed(message) => errorlog::error("directory", message),
+            Event::DirectoryBound => errorlog::info("directory", "bind accepted"),
             _ => {}
         }
 
@@ -356,6 +407,11 @@ async fn run<F: Fn() + Send + 'static>(
     // Graph.
     let config_for_export = config.mariadb.clone();
     let http_for_update = http.clone();
+    // The domain controller has nothing to do with Graph either, and its two
+    // paging limits are read from the same [query] section the tenant uses.
+    let directory = config.directory.clone();
+    let ldap_page_size = config.ldap_page_size();
+    let ldap_max_objects = config.query.max_objects;
     let mut client = GraphClient::new(config, http, auth);
 
     // Starts locked on every launch and is never persisted, so a console that
@@ -366,7 +422,7 @@ async fn run<F: Fn() + Send + 'static>(
         match command {
             Command::SignIn => {
                 if sign_in(&mut client, &reporter).await {
-                    load_all(&mut client, &reporter).await;
+                    load_all(&mut client, &reporter, directory.as_ref()).await;
                 }
             }
             Command::SignOut => {
@@ -377,7 +433,7 @@ async fn run<F: Fn() + Send + 'static>(
                 client.auth_mut().forget();
                 reporter.send(Event::SignedOut);
             }
-            Command::LoadAll => load_all(&mut client, &reporter).await,
+            Command::LoadAll => load_all(&mut client, &reporter, directory.as_ref()).await,
             Command::Load(collection) => load_one(&mut client, &reporter, collection).await,
             Command::GroupMembers { group_id } => {
                 reporter.send(Event::Loading(Collection::Groups));
@@ -453,6 +509,23 @@ async fn run<F: Fn() + Send + 'static>(
             }
             Command::ExportToDatabase { password, tables } => {
                 export_to_database(&config_for_export, &reporter, &password, tables).await;
+            }
+            Command::LoadDirectory {
+                collection,
+                password,
+            } => {
+                load_directory(
+                    directory.as_ref(),
+                    &reporter,
+                    collection,
+                    &password,
+                    ldap_page_size,
+                    ldap_max_objects,
+                )
+                .await;
+            }
+            Command::VerifyDirectoryBind { password } => {
+                verify_directory_bind(directory.as_ref(), &reporter, &password).await;
             }
             Command::CheckForUpdate => {
                 check_for_update(&http_for_update, &reporter).await;
@@ -716,7 +789,99 @@ async fn sign_in<F: Fn() + Send + 'static>(
     }
 }
 
-async fn load_all<F: Fn() + Send + 'static>(client: &mut GraphClient, reporter: &Reporter<F>) {
+/// Why the Directory views are empty when no domain controller is configured.
+///
+/// A cloud-only tenant is the normal case, so this is a state to explain rather
+/// than an error to report — the same treatment a tenant without Intune gets.
+fn unconfigured(collection: Collection) -> Event {
+    let reason = format!(
+        "No domain controller is configured, so there is no on-premises directory to \
+         read. Add a [directory] section to {} naming a DC, a base DN and a read-only \
+         bind account.",
+        crate::config::config_path().display()
+    );
+    match collection {
+        Collection::AdComputers => Event::AdComputers(Fetch::Unavailable(reason)),
+        _ => Event::AdUsers(Fetch::Unavailable(reason)),
+    }
+}
+
+/// Read one collection from the domain controller.
+async fn load_directory<F: Fn() + Send + 'static>(
+    settings: Option<&crate::config::Directory>,
+    reporter: &Reporter<F>,
+    collection: Collection,
+    password: &crate::mariadb::Secret,
+    page_size: i32,
+    max_objects: u32,
+) {
+    let Some(settings) = settings else {
+        reporter.send(unconfigured(collection));
+        return;
+    };
+
+    reporter.send(Event::Loading(collection));
+
+    match collection {
+        Collection::AdUsers => {
+            let result = crate::ldap::users(settings, password, page_size, max_objects).await;
+            reporter.report(collection, result, |users| {
+                Event::AdUsers(Fetch::Ready(Arc::new(users)))
+            });
+        }
+        Collection::AdComputers => {
+            let result =
+                crate::ldap::computers(settings, password, page_size, max_objects).await;
+            reporter.report(collection, result, |computers| {
+                Event::AdComputers(Fetch::Ready(Arc::new(computers)))
+            });
+        }
+        // Only the two AD collections reach here; anything else is a routing
+        // mistake in the UI rather than something the domain controller can
+        // answer, and is reported as such instead of silently doing nothing.
+        other => reporter.send(Event::Failed {
+            collection: Some(other),
+            message: format!(
+                "{} is a Microsoft 365 collection and cannot be read from a domain \
+                 controller",
+                other.label()
+            ),
+        }),
+    }
+}
+
+/// Check the bind credentials without reading a collection.
+async fn verify_directory_bind<F: Fn() + Send + 'static>(
+    settings: Option<&crate::config::Directory>,
+    reporter: &Reporter<F>,
+    password: &crate::mariadb::Secret,
+) {
+    let Some(settings) = settings else {
+        reporter.send(Event::DirectoryBindFailed(
+            "No [directory] section is configured.".into(),
+        ));
+        return;
+    };
+
+    match crate::ldap::verify(settings, password).await {
+        Ok(()) => reporter.send(Event::DirectoryBound),
+        Err(err) => reporter.send(Event::DirectoryBindFailed(format!("{err:#}"))),
+    }
+}
+
+async fn load_all<F: Fn() + Send + 'static>(
+    client: &mut GraphClient,
+    reporter: &Reporter<F>,
+    directory: Option<&crate::config::Directory>,
+) {
+    // Said once, up front, rather than when somebody opens the view: the
+    // Directory node is visible from the start, and a node that explains itself
+    // before being clicked is better than one that looks broken until it is.
+    if directory.is_none() {
+        reporter.send(unconfigured(Collection::AdUsers));
+        reporter.send(unconfigured(Collection::AdComputers));
+    }
+
     // Tenant details first: the Intune result below is interpreted against it.
     match client.organization().await {
         Ok(org) => reporter.send(Event::Organization(Box::new(org))),
@@ -803,6 +968,17 @@ async fn load_one<F: Fn() + Send + 'static>(
                 Event::Mailboxes(share(fetch))
             });
         }
+        // Graph cannot answer for an on-premises directory. Reaching here means
+        // a `Load` was sent where a `LoadDirectory` was needed — the UI routes
+        // on `Collection::is_directory`, so this should be unreachable, and it
+        // says so rather than leaving the view spinning forever.
+        Collection::AdUsers | Collection::AdComputers => reporter.send(Event::Failed {
+            collection: Some(collection),
+            message: format!(
+                "{} comes from a domain controller and cannot be read from Graph",
+                collection.label()
+            ),
+        }),
     }
 }
 

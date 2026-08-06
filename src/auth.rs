@@ -717,6 +717,7 @@ mod tests {
             cloud: Default::default(),
             query: Default::default(),
             mariadb: None,
+            directory: None,
         };
         Authenticator::new(config, reqwest::Client::new())
     }

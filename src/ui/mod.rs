@@ -7,6 +7,7 @@
 mod confirm;
 mod database;
 mod details;
+mod directory;
 mod export;
 mod forms;
 mod help;
@@ -29,6 +30,7 @@ use crate::config::{Config, config_path};
 use crate::graph::Fetch;
 use crate::graph::actions::{Action, Severity};
 use crate::graph::models::*;
+use crate::ldap::models::{AdComputer, AdUser};
 use crate::worker::{Collection, Command, Event, Worker};
 
 pub const FRIENDLY_NAME: &str = "Graphical Cloud Manager";
@@ -103,9 +105,19 @@ pub enum View {
     Teams,
     SignIns,
     AuditLogs,
+    AdUsers,
+    AdComputers,
 }
 
 impl View {
+    /// True for the views served by a domain controller rather than by Graph.
+    ///
+    /// These need a bind password before they can load, which is the one thing
+    /// that makes them behave differently from every other node in the tree.
+    pub fn is_directory(self) -> bool {
+        matches!(self, View::AdUsers | View::AdComputers)
+    }
+
     pub fn title(self) -> &'static str {
         match self {
             View::Overview => "Console Root",
@@ -119,6 +131,8 @@ impl View {
             View::Teams => "Teams",
             View::SignIns => "Sign-in Logs",
             View::AuditLogs => "Audit Logs",
+            View::AdUsers => "AD Users (on-premises)",
+            View::AdComputers => "AD Computers (on-premises)",
         }
     }
 
@@ -136,6 +150,8 @@ impl View {
             View::Teams => Some(Collection::Teams),
             View::SignIns => Some(Collection::SignIns),
             View::AuditLogs => Some(Collection::AuditLogs),
+            View::AdUsers => Some(Collection::AdUsers),
+            View::AdComputers => Some(Collection::AdComputers),
         }
     }
 
@@ -159,6 +175,8 @@ impl View {
             View::Teams => Some("teams"),
             View::SignIns => Some("sign_ins"),
             View::AuditLogs => Some("audit_logs"),
+            View::AdUsers => Some("ad_users"),
+            View::AdComputers => Some("ad_computers"),
         }
     }
 
@@ -174,6 +192,8 @@ impl View {
         View::Teams,
         View::SignIns,
         View::AuditLogs,
+        View::AdUsers,
+        View::AdComputers,
     ];
 
     /// True for the views that read a log rather than a directory collection.
@@ -219,6 +239,15 @@ struct Store {
     audits: Option<Fetch<Arc<Vec<DirectoryAudit>>>>,
     teams: Option<Fetch<Arc<Vec<Team>>>>,
     mailboxes: Option<Fetch<Arc<Vec<Mailbox>>>>,
+    /// On-premises accounts, when a domain controller is configured and has
+    /// been bound to. `Unavailable` covers the ordinary cloud-only case.
+    ad_users: Option<Fetch<Arc<Vec<AdUser>>>>,
+    ad_computers: Option<Fetch<Arc<Vec<AdComputer>>>>,
+    /// AD users indexed by lower-cased sAMAccountName, rebuilt whenever the AD
+    /// user list is replaced. This is what joins the two directories together
+    /// in the Entra Users pane; building it once beats scanning the whole AD
+    /// list on every frame the selection sits on a synced account.
+    ad_by_sam: HashMap<String, usize>,
 
     /// Lazily loaded details, keyed by object id.
     group_members: HashMap<String, (Arc<Vec<DirectoryMember>>, Arc<Vec<DirectoryMember>>)>,
@@ -272,6 +301,8 @@ impl Store {
             View::Teams => ready(&self.teams),
             View::SignIns => ready(&self.sign_ins),
             View::AuditLogs => ready(&self.audits),
+            View::AdUsers => ready(&self.ad_users),
+            View::AdComputers => ready(&self.ad_computers),
         }
     }
 
@@ -293,6 +324,57 @@ impl Store {
             View::Teams => reason(&self.teams),
             View::SignIns => reason(&self.sign_ins),
             View::AuditLogs => reason(&self.audits),
+            View::AdUsers => reason(&self.ad_users),
+            View::AdComputers => reason(&self.ad_computers),
+            _ => None,
+        }
+    }
+
+    /// Store the AD user list *and* rebuild the index that joins it to Entra.
+    ///
+    /// One method rather than two statements, because `ad_by_sam` holds
+    /// positions into exactly this list. Assigning the list without rebuilding
+    /// the index leaves the join silently answering from stale positions — or,
+    /// on a first load, answering nothing at all while every synced account
+    /// reports "no matching account found", which is indistinguishable from a
+    /// genuinely absent object. Making the two inseparable is the only way that
+    /// cannot be got wrong at a call site.
+    ///
+    /// The key is the lower-cased sAMAccountName: the one identifier both
+    /// directories agree on. Entra carries it as `onPremisesSamAccountName` on
+    /// every synced account, and it survives the UPN changes and mail-domain
+    /// moves that break every other join. Case is folded because AD treats it
+    /// case-insensitively and Entra echoes back whatever was set at sync time.
+    fn set_ad_users(&mut self, fetch: Fetch<Arc<Vec<AdUser>>>) {
+        self.ad_by_sam.clear();
+        if let Fetch::Ready(users) = &fetch {
+            for (index, user) in users.iter().enumerate() {
+                if let Some(sam) = &user.sam_account_name {
+                    self.ad_by_sam.insert(sam.to_lowercase(), index);
+                }
+            }
+        }
+        self.ad_users = Some(fetch);
+    }
+
+    /// Forget the AD user list *and* its index, so a refresh cannot leave
+    /// positions behind pointing into a list that is no longer there.
+    fn clear_ad_users(&mut self) {
+        self.ad_by_sam.clear();
+        self.ad_users = None;
+    }
+
+    /// The AD account behind a synced Entra user, if it has been read.
+    ///
+    /// Returns `None` for a cloud-only account, for a synced one whose AD
+    /// object is outside the configured base DN, and whenever the Directory
+    /// node has simply not been loaded — three different situations that the
+    /// details pane distinguishes, and this deliberately does not.
+    fn ad_match(&self, user: &User) -> Option<&AdUser> {
+        let sam = user.on_premises_sam_account_name.as_ref()?;
+        let index = *self.ad_by_sam.get(&sam.to_lowercase())?;
+        match &self.ad_users {
+            Some(Fetch::Ready(users)) => users.get(index),
             _ => None,
         }
     }
@@ -456,6 +538,16 @@ pub struct App {
     mariadb_password: Option<crate::mariadb::Secret>,
     /// The export dialog, while it is open.
     database: Option<database::Prompt>,
+    /// The domain controller to read, when one is configured at all.
+    directory: Option<crate::config::Directory>,
+    /// The LDAP bind password, for as long as this session lasts. Held on the
+    /// same terms as [`Self::mariadb_password`] and cleared at the same time.
+    directory_password: Option<crate::mariadb::Secret>,
+    /// The bind dialog, while it is open.
+    directory_prompt: Option<directory::Prompt>,
+    /// The view to load once a bind succeeds — the one whose selection opened
+    /// the dialog in the first place.
+    directory_pending: Option<Collection>,
     /// Tables written so far by the export in flight.
     database_progress: Vec<(String, usize)>,
     /// Outcome of the most recent action, shown in the status bar.
@@ -478,6 +570,7 @@ impl App {
         let tenant_label = config.tenant_id().to_string();
         let log_window = describe_log_window(config.log_days(), config.log_records());
         let mariadb = config.mariadb.clone();
+        let directory = config.directory.clone();
         let worker = Worker::spawn(config, move || ctx.request_repaint());
 
         let (worker, phase) = match worker {
@@ -495,6 +588,7 @@ impl App {
         let mut expanded = HashSet::new();
         expanded.insert("groups");
         expanded.insert("devices");
+        expanded.insert("directory");
 
         Self {
             worker,
@@ -522,6 +616,10 @@ impl App {
             mariadb,
             mariadb_password: None,
             database: None,
+            directory,
+            directory_password: None,
+            directory_prompt: None,
+            directory_pending: None,
             database_progress: Vec::new(),
             batch: None,
             batch_failures: None,
@@ -545,6 +643,7 @@ impl App {
             groups: demo::groups(),
             roles: demo::roles(),
             devices: demo::devices(),
+            ad_computers: Some(demo::ad_computers()),
             managed: Some(demo::managed_devices()),
             licenses: demo::licenses(),
             mailboxes: Some(demo::mailboxes()),
@@ -591,9 +690,14 @@ impl App {
             store.mailbox_settings.extend(settings);
         }
 
+        // Through the setter rather than the struct literal above, so the
+        // sAMAccountName index is built with it — see `set_ad_users`.
+        store.set_ad_users(demo::ad_users());
+
         let mut expanded = HashSet::new();
         expanded.insert("groups");
         expanded.insert("devices");
+        expanded.insert("directory");
 
         Self {
             worker: None,
@@ -623,6 +727,13 @@ impl App {
             mariadb: Some(demo::mariadb()),
             mariadb_password: None,
             database: None,
+            // The demo domain is already "bound": there is no DC to reach, and
+            // the point of the fixtures is to exercise the panes rather than
+            // the dialog in front of them.
+            directory: Some(demo::directory()),
+            directory_password: Some(crate::mariadb::Secret::new("demo".into())),
+            directory_prompt: None,
+            directory_pending: None,
             database_progress: Vec::new(),
             batch: None,
             batch_failures: None,
@@ -663,6 +774,10 @@ impl App {
             mariadb: None,
             mariadb_password: None,
             database: None,
+            directory: None,
+            directory_password: None,
+            directory_prompt: None,
+            directory_pending: None,
             database_progress: Vec::new(),
             batch: None,
             batch_failures: None,
@@ -1070,6 +1185,9 @@ impl App {
                 // hand the machine over should not leave a database password
                 // behind them.
                 self.mariadb_password = None;
+                self.directory_password = None;
+                self.directory_prompt = None;
+                self.directory_pending = None;
                 self.phase = Phase::SigningInSilently;
                 self.status = "Signing in…".into();
                 self.send(Command::SignIn);
@@ -1117,6 +1235,39 @@ impl App {
             Event::Teams(fetch) => {
                 self.store.teams = Some(fetch);
                 self.finish(Collection::Teams);
+            }
+            Event::AdUsers(fetch) => {
+                self.store.set_ad_users(fetch);
+                self.finish(Collection::AdUsers);
+            }
+            Event::AdComputers(fetch) => {
+                self.store.ad_computers = Some(fetch);
+                self.finish(Collection::AdComputers);
+            }
+            Event::DirectoryBound => {
+                self.directory_prompt = None;
+                self.status = "Connected to Active Directory".into();
+                // The bind was only ever a credential check; the collection
+                // that wanted it still has to be read.
+                if let Some(collection) = self.directory_pending.take()
+                    && let Some(password) = self.directory_password.clone()
+                {
+                    self.send(Command::LoadDirectory {
+                        collection,
+                        password,
+                    });
+                }
+            }
+            Event::DirectoryBindFailed(message) => {
+                self.directory_password = None;
+                self.status = "Could not connect to Active Directory".into();
+                if let Some(prompt) = &mut self.directory_prompt {
+                    prompt.failed(message);
+                } else {
+                    // The dialog was dismissed while the bind was in flight;
+                    // the reason still belongs somewhere the operator can see.
+                    self.last_action = Some(Err(message));
+                }
             }
             Event::Mailboxes(fetch) => {
                 self.store.mailboxes = Some(fetch);
@@ -1413,6 +1564,22 @@ impl App {
         self.store.users.get(state.selected_source()?)
     }
 
+    fn selected_ad_user(&self) -> Option<&AdUser> {
+        let state = self.views.get(&View::AdUsers)?;
+        match &self.store.ad_users {
+            Some(Fetch::Ready(users)) => users.get(state.selected_source()?),
+            _ => None,
+        }
+    }
+
+    fn selected_ad_computer(&self) -> Option<&AdComputer> {
+        let state = self.views.get(&View::AdComputers)?;
+        match &self.store.ad_computers {
+            Some(Fetch::Ready(computers)) => computers.get(state.selected_source()?),
+            _ => None,
+        }
+    }
+
     fn selected_group(&self) -> Option<&Group> {
         let state = self.views.get(&View::Groups)?;
         self.store.groups.get(state.selected_source()?)
@@ -1515,6 +1682,20 @@ impl App {
                 self.view_state(view)
                     .refresh(version, len, |i, needle| list::audit_matches(&data[i], needle));
             }
+            View::AdUsers => {
+                let data = Store::optional(&self.store.ad_users);
+                let len = data.len();
+                self.view_state(view).refresh(version, len, |i, needle| {
+                    list::ad_user_matches(&data[i], needle)
+                });
+            }
+            View::AdComputers => {
+                let data = Store::optional(&self.store.ad_computers);
+                let len = data.len();
+                self.view_state(view).refresh(version, len, |i, needle| {
+                    list::ad_computer_matches(&data[i], needle)
+                });
+            }
         }
     }
 
@@ -1554,6 +1735,7 @@ impl eframe::App for App {
             || self.palette.is_some()
             || self.import.is_some()
             || self.database.is_some()
+            || self.directory_prompt.is_some()
             || self.batch_failures.is_some();
         if !modal_open {
             keys::handle(self, &ctx);
@@ -1561,6 +1743,7 @@ impl eframe::App for App {
         self.expire_write_mode(&ctx);
         self.refresh_filter();
         self.ensure_details();
+        self.ensure_directory_loaded();
 
         self.top_bar(ui);
         self.status_bar(ui);
@@ -1799,6 +1982,48 @@ impl App {
                 }
                 database::Outcome::Cancelled => self.status = "Export cancelled".into(),
                 database::Outcome::Pending => self.database = Some(prompt),
+            }
+            return;
+        }
+
+        if let Some(mut prompt) = self.directory_prompt.take() {
+            // Cloned for the same reason as the export settings above: the
+            // dialog needs `&mut self` for its outcome.
+            let Some(settings) = self.directory.clone() else {
+                return;
+            };
+            match directory::show(ctx, &mut prompt, &settings) {
+                directory::Outcome::Bind(password) => {
+                    self.status = format!("Connecting to {}…", settings.host);
+                    // Held provisionally, and dropped again if the DC refuses
+                    // it, so a rejected password is never left behind for the
+                    // next view to retry with.
+                    self.directory_password = Some(password.clone());
+                    self.send(Command::VerifyDirectoryBind { password });
+                    // Kept open, showing "Connecting…", until the worker either
+                    // confirms the bind or says why it was refused.
+                    self.directory_prompt = Some(prompt);
+                }
+                directory::Outcome::Cancelled => {
+                    // Say so against the view itself. Without this the list
+                    // renders its ordinary "No items." — which is a false
+                    // statement about a domain that was never read, and the
+                    // dialog does not reopen on its own, because doing that
+                    // would make cancelling impossible. Recording it as an
+                    // error also means F5 clears it and asks again.
+                    if let Some(collection) = self.directory_pending.take() {
+                        self.store.errors.insert(
+                            collection,
+                            format!(
+                                "Not connected to {}. Refresh this node (F5) to enter \
+                                 the bind password.",
+                                settings.host
+                            ),
+                        );
+                    }
+                    self.status = "Not connected to Active Directory".into();
+                }
+                directory::Outcome::Pending => self.directory_prompt = Some(prompt),
             }
             return;
         }
@@ -2365,11 +2590,81 @@ impl App {
     /// Refresh a specific node, regardless of which one is currently
     /// selected — what the nav tree's context menu acts on.
     fn refresh_view(&mut self, view: View) {
-        if let Some(collection) = view.collection() {
-            self.store.requested.clear();
-            self.send(Command::Load(collection));
-        } else {
+        let Some(collection) = view.collection() else {
             self.send(Command::LoadAll);
+            return;
+        };
+
+        self.store.requested.clear();
+
+        // An on-premises collection cannot be read from Graph, and cannot be
+        // read at all without the bind password. Clearing the request marker
+        // lets `ensure_directory_loaded` do both — re-reading when the password
+        // is already held, and re-opening the dialog when it is not.
+        if collection.is_directory() {
+            self.store.errors.remove(&collection);
+            // Only the collection being refreshed. Dropping both would discard
+            // a good computer list to re-read the users, and would leave the
+            // Users pane briefly unable to explain itself.
+            match collection {
+                Collection::AdComputers => self.store.ad_computers = None,
+                _ => self.store.clear_ad_users(),
+            }
+            return;
+        }
+
+        self.send(Command::Load(collection));
+    }
+
+    /// Read the selected on-premises collection, asking to bind first if
+    /// nothing has been bound yet.
+    ///
+    /// Lazy, unlike every Graph collection, which `LoadAll` fetches up front.
+    /// Two reasons, and both are about the credential rather than the data:
+    /// prompting for a bind password at launch would demand it from every
+    /// operator who never opens the node, and the worker cannot fetch these on
+    /// its own because it deliberately does not keep the password.
+    fn ensure_directory_loaded(&mut self) {
+        if !self.view.is_directory() {
+            return;
+        }
+        let Some(collection) = self.view.collection() else {
+            return;
+        };
+
+        // Loaded, in flight, already explained as unavailable, or failed once
+        // already — a failure must not become a retry loop against a DC.
+        if self.store.count(self.view).is_some()
+            || self.store.loading.contains(&collection)
+            || self.store.unavailable(self.view).is_some()
+            || self.store.errors.contains_key(&collection)
+            || self.directory_prompt.is_some()
+        {
+            return;
+        }
+
+        // No [directory] section: the worker has already said so, and saying it
+        // again here would only race with that.
+        if self.directory.is_none() {
+            return;
+        }
+
+        // Requested but not yet acknowledged. Without this the next frame would
+        // send the same read again, because `Event::Loading` has not arrived.
+        let key = format!("directory:{}", collection.label());
+        if !self.store.requested.insert(key) {
+            return;
+        }
+
+        match self.directory_password.clone() {
+            Some(password) => self.send(Command::LoadDirectory {
+                collection,
+                password,
+            }),
+            None => {
+                self.directory_pending = Some(collection);
+                self.directory_prompt = Some(directory::Prompt::new());
+            }
         }
     }
 
@@ -2478,5 +2773,157 @@ impl App {
                 .color(theme::MUTED),
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entra_user(sam: Option<&str>) -> User {
+        User {
+            id: "user-0001".into(),
+            display_name: Some("Aisha Rahman".into()),
+            user_principal_name: Some("aisha.rahman@contoso.co.uk".into()),
+            on_premises_sync_enabled: Some(sam.is_some()),
+            on_premises_sam_account_name: sam.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    fn ad_user(sam: &str) -> AdUser {
+        AdUser {
+            dn: "CN=Aisha Rahman,OU=Finance,DC=corp,DC=contoso,DC=co,DC=uk".into(),
+            sam_account_name: Some(sam.into()),
+            ..Default::default()
+        }
+    }
+
+    fn store_with(users: Vec<AdUser>) -> Store {
+        let mut store = Store::default();
+        store.set_ad_users(Fetch::Ready(Arc::new(users)));
+        store
+    }
+
+    #[test]
+    fn a_synced_account_is_joined_to_its_ad_object() {
+        let store = store_with(vec![ad_user("someone.else"), ad_user("aisha.rahman")]);
+        let matched = store
+            .ad_match(&entra_user(Some("aisha.rahman")))
+            .expect("the synced account must find its AD object");
+        assert_eq!(matched.ou(), "corp.contoso.co.uk/Finance");
+    }
+
+    #[test]
+    fn the_join_folds_case_on_both_sides() {
+        // AD treats sAMAccountName case-insensitively, and Entra echoes back
+        // whatever case was set at sync time. Matching exactly would drop the
+        // join for any account whose two directories disagree about capitals.
+        let store = store_with(vec![ad_user("Aisha.Rahman")]);
+        assert!(
+            store.ad_match(&entra_user(Some("aisha.rahman"))).is_some(),
+            "a case difference must not break the join"
+        );
+    }
+
+    #[test]
+    fn a_cloud_only_account_has_no_on_premises_half() {
+        let store = store_with(vec![ad_user("aisha.rahman")]);
+        assert!(store.ad_match(&entra_user(None)).is_none());
+    }
+
+    #[test]
+    fn an_account_outside_the_base_dn_simply_does_not_match() {
+        // Synced, but its AD object is not under the configured base — a real
+        // situation in a multi-domain forest, and not an error.
+        let store = store_with(vec![ad_user("someone.else")]);
+        assert!(store.ad_match(&entra_user(Some("aisha.rahman"))).is_none());
+    }
+
+    #[test]
+    fn nothing_matches_before_the_directory_has_been_read() {
+        let store = Store::default();
+        assert!(store.ad_match(&entra_user(Some("aisha.rahman"))).is_none());
+    }
+
+    #[test]
+    fn an_unavailable_directory_clears_a_previous_index() {
+        // Otherwise a stale index would go on resolving to indices in a list
+        // that is no longer there — `ad_match` would return the wrong account
+        // or, worse, a plausible one.
+        let mut store = store_with(vec![ad_user("aisha.rahman")]);
+        assert!(store.ad_match(&entra_user(Some("aisha.rahman"))).is_some());
+
+        store.set_ad_users(Fetch::Unavailable("no domain".into()));
+        assert!(store.ad_match(&entra_user(Some("aisha.rahman"))).is_none());
+    }
+
+    #[test]
+    fn the_index_survives_a_reload_that_reorders_the_list() {
+        // The index holds positions, so it must be rebuilt with the list it
+        // describes rather than carried over from the previous read.
+        let mut store = store_with(vec![ad_user("aisha.rahman"), ad_user("svc-sql")]);
+        store.set_ad_users(Fetch::Ready(Arc::new(vec![
+            ad_user("svc-sql"),
+            ad_user("aisha.rahman"),
+        ])));
+
+        let matched = store
+            .ad_match(&entra_user(Some("aisha.rahman")))
+            .expect("still joined after a reload");
+        assert_eq!(matched.sam(), "aisha.rahman");
+    }
+
+    /// The demo fixtures have to agree with each other, or the console shows
+    /// "no matching account was found" for every synthetic user and the join
+    /// looks broken when only the fixtures were.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_demo_fixtures_actually_correlate() {
+        let mut store = Store::default();
+        store.set_ad_users(crate::demo::ad_users());
+
+        let synced: Vec<User> = crate::demo::users()
+            .iter()
+            .filter(|user| user.on_premises_sync_enabled.unwrap_or(false))
+            .cloned()
+            .collect();
+        assert!(!synced.is_empty(), "the fixtures must include synced users");
+
+        let matched = synced
+            .iter()
+            .filter(|user| store.ad_match(user).is_some())
+            .count();
+        assert!(
+            matched > 0,
+            "no demo user joined to an AD object — the two fixtures disagree about \
+             sAMAccountName"
+        );
+    }
+
+    #[test]
+    fn on_premises_collections_are_routed_away_from_graph() {
+        // `refresh_view` sends `Command::Load` for Graph collections and must
+        // not for these — the worker would reject it, and the view would sit
+        // there looking broken.
+        assert!(Collection::AdUsers.is_directory());
+        assert!(Collection::AdComputers.is_directory());
+        assert!(!Collection::Users.is_directory());
+        assert!(View::AdUsers.is_directory());
+        assert!(!View::Users.is_directory());
+    }
+
+    #[test]
+    fn every_on_premises_view_has_a_distinct_export_table() {
+        // The AD views join `View::ALL`, so they are exported alongside the
+        // tenant's own collections; a stem collision would silently overwrite
+        // somebody's table.
+        let mut stems: Vec<&str> = View::ALL.iter().filter_map(|v| v.table_stem()).collect();
+        let total = stems.len();
+        stems.sort_unstable();
+        stems.dedup();
+        assert_eq!(stems.len(), total, "two views share an export table name");
+        assert!(stems.contains(&"ad_users"));
+        assert!(stems.contains(&"ad_computers"));
     }
 }

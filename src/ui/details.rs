@@ -106,6 +106,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 View::Teams => team_details(app, ui),
                 View::SignIns => sign_in_details(app, ui),
                 View::AuditLogs => audit_details(app, ui),
+                View::AdUsers => ad_user_details(app, ui),
+                View::AdComputers => ad_computer_details(app, ui),
             }
         });
 
@@ -270,6 +272,8 @@ fn user_details(app: &mut App, ui: &mut egui::Ui) {
         }
     }
 
+    on_premises_section(app, ui, &user);
+
     section(ui, "MEMBER OF");
     match app.store.user_memberships.get(&user.id) {
         Some(memberships) if memberships.is_empty() => {
@@ -278,6 +282,267 @@ fn user_details(app: &mut App, ui: &mut egui::Ui) {
         Some(memberships) => member_list(ui, memberships),
         None => loading(ui),
     }
+}
+
+/// What Active Directory says about a synced account, inside the Entra pane.
+///
+/// This is the half of a hybrid account the tenant cannot tell you about.
+/// `onPremisesSyncEnabled` says an account came from AD and then stops: the OU
+/// it lives in, the `userAccountControl` flags on it, when its password was
+/// really last set, and which of its groups never made it to the cloud are all
+/// on the other side of the sync, and are usually the reason somebody was
+/// looking. Graph shows the shadow; this shows the object.
+///
+/// Nothing is drawn for a cloud-only account. There is no on-premises half to
+/// report and a section saying so on every account in a cloud-only tenant would
+/// be noise on the pane that matters most.
+fn on_premises_section(app: &App, ui: &mut egui::Ui, user: &User) {
+    if !user.on_premises_sync_enabled.unwrap_or(false) {
+        return;
+    }
+
+    section(ui, "ON-PREMISES (ACTIVE DIRECTORY)");
+
+    let Some(ad) = app.store.ad_match(user) else {
+        // Three different reasons to have nothing, and they need different
+        // answers — so they are told apart rather than collapsed into a shrug.
+        let message = if app.directory.is_none() {
+            "This account is synced from Active Directory. Configure a [directory] \
+             section to see the domain's own record of it."
+        } else if app.store.ad_users.is_none() {
+            "Open the Directory node to read this account's on-premises record."
+        } else {
+            "No matching account was found under the configured base DN. The account \
+             may sync from a different OU, domain or forest."
+        };
+        ui.label(RichText::new(message).small().color(theme::MUTED));
+        return;
+    };
+
+    field_colored(
+        ui,
+        "AD account",
+        ad.status(),
+        theme::status_color(ad.status()),
+    );
+
+    // The disagreement worth catching. A disabled AD account whose Entra shadow
+    // is still enabled means the sync has not run, or has not been told — and
+    // for the interval in between, a leaver still has a working cloud account.
+    if ad.is_disabled() && user.account_enabled.unwrap_or(false) {
+        ui.label(
+            RichText::new(
+                "Disabled on-premises but still enabled in the tenant — the accounts \
+                 are out of step.",
+            )
+            .small()
+            .color(theme::WARN),
+        );
+    }
+
+    field(ui, "Organisational unit", &ad.ou());
+    field(ui, "Distinguished name", &ad.dn);
+    if let Some(manager) = ad.manager_name() {
+        field(ui, "Manager", &manager);
+    }
+
+    // The authoritative password age. Entra's own
+    // `lastPasswordChangeDateTime` tracks the *cloud* credential, which for a
+    // synced account is written by password hash sync and is not the same
+    // event — reading it as "when they last changed their password" is wrong
+    // by however long the sync took, and meaningless where sync is off.
+    field(ui, "Password last set", &fmt_date(&ad.pwd_last_set));
+    if ad.password_never_expires() {
+        ui.label(
+            RichText::new("Password is set never to expire")
+                .small()
+                .color(theme::WARN),
+        );
+    }
+    field(ui, "Last logon", &fmt_date(&ad.last_logon));
+    if let Some(expiry) = ad.account_expires {
+        field(ui, "Account expires", &fmt_date(&Some(expiry)));
+    }
+    if let Some(locked) = ad.lockout_time {
+        field_colored(ui, "Locked out at", &fmt_date(&Some(locked)), theme::BAD);
+    }
+    field(ui, "Created", &fmt_date(&ad.when_created));
+    field(ui, "Last changed", &fmt_date(&ad.when_changed));
+    if let Some(guid) = &ad.object_guid {
+        field(ui, "Object GUID", guid);
+    }
+    if let Some(sid) = &ad.object_sid {
+        field(ui, "Object SID", sid);
+    }
+
+    let flags = ad.flags();
+    if !flags.is_empty() {
+        section(ui, "ACCOUNT FLAGS");
+        for flag in flags {
+            ui.horizontal(|ui| {
+                ui.label("•");
+                ui.label(RichText::new(flag).color(theme::WARN));
+            });
+        }
+    }
+
+    // Only the groups the tenant does not already list. An AD group that syncs
+    // to Entra appears in MEMBER OF below, and repeating it here would bury the
+    // ones that matter — the domain-local and built-in groups that never sync,
+    // and which are exactly the memberships nobody can see from the portal.
+    //
+    // Nothing is claimed until the tenant's own membership list has arrived.
+    // The heading below asserts these groups are *not* in the tenant, and
+    // subtracting an empty list would assert it of every group the account has
+    // — briefly, and wrongly, on the frame before the memberships land.
+    let Some(memberships) = app.store.user_memberships.get(&user.id) else {
+        return;
+    };
+    let synced: Vec<String> = memberships
+        .iter()
+        .map(|member| member.name().to_lowercase())
+        .collect();
+
+    let unsynced: Vec<String> = ad
+        .group_names()
+        .into_iter()
+        .filter(|name| !synced.contains(&name.to_lowercase()))
+        .collect();
+
+    if !unsynced.is_empty() {
+        section(ui, "ON-PREMISES GROUPS ONLY");
+        ui.label(
+            RichText::new("Not present in the tenant's group list.")
+                .small()
+                .color(theme::MUTED),
+        );
+        ui.add_space(4.0);
+        for name in unsynced {
+            ui.horizontal(|ui| {
+                ui.label("•");
+                ui.label(name);
+            });
+        }
+    }
+}
+
+// ---- The on-premises views -------------------------------------------------
+
+fn ad_user_details(app: &mut App, ui: &mut egui::Ui) {
+    let Some(user) = app.selected_ad_user().cloned() else {
+        hint(ui, "Select an account to see its details.");
+        return;
+    };
+
+    title(ui, user.name());
+
+    field(ui, "SAM account", user.sam());
+    field_colored(
+        ui,
+        "Account",
+        user.status(),
+        theme::status_color(user.status()),
+    );
+    field(ui, "Sign-in name", user.upn());
+    field(ui, "Email", &fmt_opt(&user.mail));
+
+    section(ui, "ORGANISATION");
+    field(ui, "Job title", &fmt_opt(&user.title));
+    field(ui, "Department", &fmt_opt(&user.department));
+    field(ui, "Company", &fmt_opt(&user.company));
+    field(ui, "Office", &fmt_opt(&user.office));
+    field(ui, "Telephone", &fmt_opt(&user.telephone));
+    field(ui, "Mobile", &fmt_opt(&user.mobile));
+    if let Some(manager) = user.manager_name() {
+        field(ui, "Manager", &manager);
+    }
+    field(ui, "Employee ID", &fmt_opt(&user.employee_id));
+
+    section(ui, "DIRECTORY");
+    field(ui, "Organisational unit", &user.ou());
+    field(ui, "Distinguished name", &user.dn);
+    field(ui, "Object GUID", &fmt_opt(&user.object_guid));
+    field(ui, "Object SID", &fmt_opt(&user.object_sid));
+    field(ui, "Description", &fmt_opt(&user.description));
+
+    section(ui, "PASSWORD AND LOGON");
+    field(ui, "Password last set", &fmt_date(&user.pwd_last_set));
+    // `lastLogonTimestamp` replicates on a nine-to-fourteen day delay by
+    // design, so treating it as "last seen" is wrong by up to a fortnight —
+    // which is precisely the window somebody uses it to judge. Said here
+    // rather than left to be rediscovered.
+    field(ui, "Last logon", &fmt_date(&user.last_logon));
+    ui.label(
+        RichText::new("Replicated on a delay of up to 14 days.")
+            .small()
+            .color(theme::MUTED),
+    );
+    field(ui, "Account expires", &fmt_date(&user.account_expires));
+    if let Some(locked) = user.lockout_time {
+        field_colored(ui, "Locked out at", &fmt_date(&Some(locked)), theme::BAD);
+    }
+    field(ui, "Created", &fmt_date(&user.when_created));
+    field(ui, "Last changed", &fmt_date(&user.when_changed));
+
+    let flags = user.flags();
+    if !flags.is_empty() {
+        section(ui, "ACCOUNT FLAGS");
+        for flag in flags {
+            ui.horizontal(|ui| {
+                ui.label("•");
+                ui.label(RichText::new(flag).color(theme::WARN));
+            });
+        }
+    }
+
+    section(ui, "MEMBER OF");
+    let groups = user.group_names();
+    if groups.is_empty() {
+        ui.label(RichText::new("No group memberships").color(theme::MUTED));
+    } else {
+        for name in groups {
+            ui.horizontal(|ui| {
+                ui.label("•");
+                ui.label(name);
+            });
+        }
+    }
+}
+
+fn ad_computer_details(app: &mut App, ui: &mut egui::Ui) {
+    let Some(computer) = app.selected_ad_computer().cloned() else {
+        hint(ui, "Select a computer to see its details.");
+        return;
+    };
+
+    title(ui, computer.name());
+
+    field_colored(
+        ui,
+        "Account",
+        computer.status(),
+        theme::status_color(computer.status()),
+    );
+    field(ui, "Role", computer.role());
+    field(ui, "DNS name", &fmt_opt(&computer.dns_host_name));
+    field(ui, "Operating system", &computer.os_display());
+
+    section(ui, "DIRECTORY");
+    field(ui, "Organisational unit", &computer.ou());
+    field(ui, "Distinguished name", &computer.dn);
+    field(ui, "Object GUID", &fmt_opt(&computer.object_guid));
+    field(ui, "SAM account", &fmt_opt(&computer.sam_account_name));
+    if let Some(owner) = computer.managed_by_name() {
+        field(ui, "Managed by", &owner);
+    }
+    field(ui, "Description", &fmt_opt(&computer.description));
+    field(ui, "Created", &fmt_date(&computer.when_created));
+    field(ui, "Last logon", &fmt_date(&computer.last_logon));
+    ui.label(
+        RichText::new("Replicated on a delay of up to 14 days.")
+            .small()
+            .color(theme::MUTED),
+    );
 }
 
 fn group_details(app: &mut App, ui: &mut egui::Ui) {

@@ -42,6 +42,8 @@ time**, and changing anything requires deliberately arming write mode — see
 | **Teams** | Every team with visibility and archived state. Details add channels with their addresses, what members and guests are allowed to do, messaging and Giphy settings, and a link straight into the Teams client. |
 | **Sign-in Logs** | Recent sign-ins with the user, application, outcome, risk state and location. Details add the failure code and reason, the device and its compliance, Conditional Access outcome, and the correlation ID to quote at Microsoft support. |
 | **Audit Logs** | Recent directory changes: what happened, in which category, who did it, to what, and whether it worked — with the before-and-after values of each modified property. |
+| **AD Users** | User accounts read straight from an on-premises domain controller: SAM account, UPN, status and OU. Details decode `userAccountControl` into readable flags, and add the real `pwdLastSet`, last logon, account expiry, lockout state, object GUID and SID, and group membership. Optional — see [On-premises Active Directory](#on-premises-active-directory). |
+| **AD Computers** | Computer accounts with DNS name, operating system, whether the machine is a domain controller or a member, and its OU. |
 
 ### Where the mailbox list comes from
 
@@ -176,6 +178,13 @@ max_objects = 0    ; stop after this many per collection; 0 means no limit
 [cloud]            ; sovereign clouds only
 authority = "https://login.microsoftonline.us"
 graph     = "https://graph.microsoft.us"
+
+[directory]        ; on-premises Active Directory; see below
+host    = "dc01.corp.contoso.com"
+port    = 636
+base_dn = "DC=corp,DC=contoso,DC=com"
+bind_dn = "CORP\\svc-gcm"
+tls     = true
 ```
 
 The file is INI-shaped and parsed as TOML, so both `;` and `#` introduce a
@@ -548,6 +557,75 @@ Import covers attributes, membership and licences. It deliberately cannot create
 or delete objects, or enable and disable accounts — those stay deliberate,
 one-at-a-time or bulk-selected actions in the console.
 
+## On-premises Active Directory
+
+Optional, and off unless configured. Add a `[directory]` section and the console
+grows a **Directory** node reading a domain controller over LDAP, alongside
+everything it already reads from the tenant.
+
+```ini
+[directory]
+host      = "dc01.corp.contoso.com"
+port      = 636
+base_dn   = "DC=corp,DC=contoso,DC=com"
+bind_dn   = "CORP\\svc-gcm"           ; a DN, DOMAIN\\user or a UPN all work
+tls       = true                     ; LDAPS
+start_tls = false                    ; or TLS on port 389, where that is all there is
+```
+
+A **read-only** account is sufficient. Nothing in this release writes to Active
+Directory — there is no AD action in the menus and none in the code — so the
+write gate has nothing to govern here.
+
+There is no password in the file, for the same reason there is none for the
+MariaDB export: gcm asks for the bind password the first time you open a
+Directory view and keeps it in memory only, so the configuration stays safe to
+paste into a support ticket. Signing out forgets it along with everything else.
+
+### What it joins up
+
+The more useful half is not the new node — it is what appears in the **Users**
+pane. Graph will tell you an account is synced from AD and then stop. The OU it
+lives in, the `userAccountControl` flags on it, when its password was *really*
+last set, and which of its groups never made it to the cloud are all on the
+other side of the sync, and are usually the reason you were looking.
+
+Selecting a synced user now shows an **On-premises (Active Directory)** section
+carrying exactly that, plus two things worth calling out:
+
+- **A disabled AD account whose tenant shadow is still enabled** is flagged. For
+  however long the sync takes to notice, a leaver still has a working cloud
+  account.
+- **Password last set** is AD's `pwdLastSet`, not Entra's
+  `lastPasswordChangeDateTime`. For a synced account the latter records when
+  password hash sync wrote the cloud credential, which is a different event —
+  and where sync is off, it is not an answer at all.
+
+The join is on `sAMAccountName`, matched case-insensitively against the tenant's
+`onPremisesSamAccountName`. It is the one identifier both directories agree on,
+and the only one that survives a UPN change or a mail-domain move.
+
+### Things it will not do
+
+- **No SRV discovery.** `host` names a domain controller explicitly. Finding one
+  via `_ldap._tcp.dc._msdcs` would mean shipping a DNS resolver, and naming the
+  DC is also the only way to pin reads to a particular replica.
+- **Simple bind only.** No Kerberos or NTLM, so the bind password is sent in the
+  bind request — which is why `tls` defaults to on and the dialog says so in red
+  when it is not.
+- **`lastLogonTimestamp`, not `lastLogon`.** It replicates on a delay of up to
+  14 days by design. Both the table and the details pane say so, because that is
+  precisely the window people use it to judge.
+- **One domain.** Searches run from a single `base_dn` on a single DC. An
+  account synced from a different domain in the forest simply will not match,
+  and the Users pane says that rather than implying the account is missing.
+
+Paging uses AD's simple paged-results control with the same `page_size` and
+`max_objects` from `[query]` that Graph uses, clamped to 1000 rather than 999 —
+Active Directory's own `MaxPageSize` default, which a DC silently enforces
+rather than reporting.
+
+
 ## Keyboard
 
 Press **F1** in the app for the same table. On macOS, `Ctrl` below is `Cmd`.
@@ -668,6 +746,7 @@ GCM_DEMO=1 GCM_DEMO_NO_INTUNE=1 cargo run       # ...without Intune
 GCM_DEMO=1 GCM_DEMO_NO_EXCHANGE=1 cargo run     # ...without Exchange
 GCM_DEMO=1 GCM_DEMO_NO_TEAMS=1 cargo run        # ...without Teams
 GCM_DEMO=1 GCM_DEMO_NO_AUDIT=1 cargo run        # ...without Entra ID P1
+GCM_DEMO=1 GCM_DEMO_NO_DIRECTORY=1 cargo run    # ...without an on-premises domain
 ```
 
 The `NO_*` switches exist so the unavailable-feature paths can be exercised
@@ -696,10 +775,17 @@ tree's flattening and reachability.
 | `config` | Loads the INI from the user directory; writes the template on first run. |
 | `auth` | Authorization code flow with PKCE, refresh-token cache, silent renewal. |
 | `graph` | Paged Graph client, resource models, SKU name table, `reports` (the CSV usage reports), `actions` (every mutation, as data). |
+| `ldap` | Read-only Active Directory client: LDAPS bind, paged subtree searches, and `models` — the conversions that make `userAccountControl`, Windows FILETIMEs and distinguished names legible. |
 | `worker` | Owns the Tokio runtime; the UI talks to it over command/event channels and never blocks or awaits. Also the single choke point every write passes through. |
 | `actionlog` | The audit trail: one JSON line per attempted write. |
 | `errorlog` | The diagnostic log: everything that failed or was refused. |
-| `ui` | The console: `nav` (scope tree), `list` (virtualized results), `details` (property sheet), `forms` and `confirm` (the input and approval halves of an action), `menu` (what can be done to an object, in one place), `keys`, `help`, `quips`, `theme`. |
+| `ui` | The console: `nav` (scope tree), `list` (virtualized results), `details` (property sheet), `forms` and `confirm` (the input and approval halves of an action), `menu` (what can be done to an object, in one place), `keys`, `help`, `quips`, `theme`, and the two credential dialogs `database` and `directory`. |
+
+Nothing upstream of `worker` knows whether a collection came from Graph or from
+a domain controller: both arrive as the same events over the same channel, and
+both use `Fetch::Unavailable` to explain themselves when a tenant has no Intune
+or an estate has no domain. The one place the difference shows is that an AD
+read carries a bind password with the request, so the worker never holds one.
 
 The result list is virtualized and builds only the rows on screen, so a tenant
 with fifty thousand users costs the same per frame as one with fifty. Group and
@@ -748,6 +834,9 @@ cover still renders instead of becoming a tofu box.
   anything else falls back to its raw part number, and the details pane says so.
 - Licence assignment is read from each user's `assignedLicenses`, so it reflects
   direct and group-inherited licences together without distinguishing them.
+- The Active Directory views are read-only, bind with a simple bind rather than
+  Kerberos, and read one domain from one named DC. See
+  [On-premises Active Directory](#on-premises-active-directory).
 
 ## Licence
 
