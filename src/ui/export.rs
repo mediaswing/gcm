@@ -102,11 +102,28 @@ pub fn database_tables(app: &App) -> Vec<crate::mariadb::Table> {
         .collect()
 }
 
+/// Neutralise CSV/formula injection.
+///
+/// A cell beginning with `=`, `+`, `-` or `@` is a formula the moment Excel or
+/// Sheets opens the file, not just text that happens to start that way — a
+/// display name or job title of `=cmd|'/c calc'!A1` (which a tenant's own
+/// self-service profile edit can produce; nothing here is operator-typed) would
+/// run when whoever exported the view opened it. A leading apostrophe is
+/// Excel's own "treat this as text" marker: it defuses the formula without
+/// changing what the cell reads as.
+fn defuse(value: &str) -> String {
+    match value.chars().next() {
+        Some('=' | '+' | '-' | '@') => format!("'{value}"),
+        _ => value.to_string(),
+    }
+}
+
 fn to_csv(headers: &[&str], rows: &[Vec<String>]) -> Result<String> {
     let mut writer = csv::Writer::from_writer(Vec::new());
     writer.write_record(headers).context("writing the header")?;
     for row in rows {
-        writer.write_record(row).context("writing a row")?;
+        let defused: Vec<String> = row.iter().map(|cell| defuse(cell)).collect();
+        writer.write_record(&defused).context("writing a row")?;
     }
     let bytes = writer.into_inner().context("finishing the CSV")?;
     String::from_utf8(bytes).context("the CSV was not valid UTF-8")
@@ -182,6 +199,30 @@ mod tests {
         assert!(csv.contains("\"line one\nline two\""));
         // Values needing no quoting are left alone.
         assert!(csv.contains("Plain,no punctuation"));
+    }
+
+    #[test]
+    fn csv_defuses_values_that_would_run_as_a_formula() {
+        // A tenant's own self-service profile edit can put any of these in a
+        // display name or job title — the operator never typed them, so the
+        // export is the only place left to make them inert.
+        let headers = ["Name"];
+        let rows = vec![
+            vec!["=cmd|'/c calc'!A1".to_string()],
+            vec!["+1 555 0100".to_string()],
+            vec!["-2".to_string()],
+            vec!["@SUM(1,2)".to_string()],
+            vec!["Aisha Rahman".to_string()],
+        ];
+
+        let csv = to_csv(&headers, &rows).expect("should render");
+
+        assert!(csv.contains("'=cmd|'/c calc'!A1"));
+        assert!(csv.contains("'+1 555 0100"));
+        assert!(csv.contains("'-2"));
+        assert!(csv.contains("'@SUM(1,2)"));
+        // A value with none of the dangerous leading characters is untouched.
+        assert!(csv.contains("\nAisha Rahman\n") || csv.ends_with("Aisha Rahman\n"));
     }
 
     #[test]

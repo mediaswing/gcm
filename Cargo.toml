@@ -28,3 +28,7 @@ sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
 toml = "1.1.4"
 urlencoding = "2.1.3"
+# Unpacking the release zip during a self-update. Deflate is the only codec
+# either packaging step (PowerShell's Compress-Archive, macOS's `zip`) uses,
+# so nothing else needs to compile in.
+zip = { version = "2.2.2", default-features = false, features = ["deflate"] }

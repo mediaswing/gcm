@@ -17,6 +17,7 @@ mod menu;
 mod nav;
 mod quips;
 mod theme;
+mod update;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -464,6 +465,9 @@ pub struct App {
     /// What failed in the last batch, shown until dismissed. A partial failure
     /// has to be read, not glimpsed in a status bar.
     batch_failures: Option<(usize, Vec<(String, String)>)>,
+    /// A release newer than this build, offered once and then either applied
+    /// or dismissed for the rest of the session.
+    pending_update: Option<crate::update::Release>,
 }
 
 impl App {
@@ -479,6 +483,10 @@ impl App {
         let (worker, phase) = match worker {
             Ok(worker) => {
                 worker.send(Command::SignIn);
+                // Once per launch, off the back of sign-in rather than
+                // gating on it: a tenant that is slow to answer should not
+                // also delay finding out a new build exists.
+                worker.send(Command::CheckForUpdate);
                 (Some(worker), Phase::SigningInSilently)
             }
             Err(err) => (None, Phase::Fatal(format!("Could not start: {err}"))),
@@ -517,6 +525,7 @@ impl App {
             database_progress: Vec::new(),
             batch: None,
             batch_failures: None,
+            pending_update: None,
             last_action: None,
             status: "Starting…".into(),
         }
@@ -617,6 +626,7 @@ impl App {
             database_progress: Vec::new(),
             batch: None,
             batch_failures: None,
+            pending_update: None,
             last_action: None,
             status: "Demo data — no tenant connected".into(),
         }
@@ -656,6 +666,7 @@ impl App {
             database_progress: Vec::new(),
             batch: None,
             batch_failures: None,
+            pending_update: None,
             last_action: None,
             status: "Configuration required".into(),
         }
@@ -1216,6 +1227,16 @@ impl App {
                 }
                 self.database_progress.clear();
             }
+            Event::UpdateAvailable(release) => {
+                self.pending_update = Some(*release);
+            }
+            Event::UpdateApplyFailed(message) => {
+                self.status = "Update failed".into();
+                self.last_action = Some(Err(format!(
+                    "Update failed — {message}. gcm is unchanged; try again later or \
+                     download it by hand from the release page."
+                )));
+            }
             Event::WriteRejected(label) => {
                 // Only reachable if something bypassed the UI gate; say so
                 // plainly rather than failing silently.
@@ -1609,6 +1630,30 @@ impl App {
         }
     }
 
+    /// Open the create-group form, and move to the Groups node so the new
+    /// group is visible in the list the moment it is created.
+    fn new_group(&mut self) {
+        self.open_form(forms::Form::CreateGroup {
+            display_name: String::new(),
+            mail_nickname: String::new(),
+            description: String::new(),
+            unified: false,
+        });
+        if self.form.is_some() {
+            self.go_to(View::Groups);
+        }
+    }
+
+    /// `Ctrl+N` and the toolbar button share this: a group while looking at
+    /// the Groups pane, a user everywhere else.
+    fn new_user_or_group(&mut self) {
+        if self.view == View::Groups {
+            self.new_group();
+        } else {
+            self.new_user();
+        }
+    }
+
     /// Open a form, refusing while read-only so the gate is one rule, not two.
     fn open_form(&mut self, form: forms::Form) {
         if !self.write_mode.is_armed() {
@@ -1768,6 +1813,23 @@ impl App {
         }
 
         let Some(pending) = &mut self.pending else {
+            // Lowest priority of everything above: an available update is
+            // worth mentioning, never worth interrupting a form, a
+            // confirmation, or anything else already on screen for.
+            if let Some(release) = self.pending_update.take() {
+                match update::show(ctx, &release) {
+                    update::Outcome::Update => {
+                        self.status = format!("Downloading gcm {}…", release.version);
+                        self.send(Command::ApplyUpdate(Box::new(release)));
+                    }
+                    update::Outcome::OpenReleasePage => {
+                        let _ = open::that_detached(&release.html_url);
+                        self.status = "Opened the release page in your browser".into();
+                    }
+                    update::Outcome::Dismissed => {}
+                    update::Outcome::Pending => self.pending_update = Some(release),
+                }
+            }
             return;
         };
 
@@ -1832,20 +1894,34 @@ impl App {
                 ui.separator();
 
                 // Always present rather than only on the Users node: creating
-                // an account is an errand somebody arrives with, not something
-                // they navigate to first.
+                // an account or a group is an errand somebody arrives with,
+                // not something they navigate to first. It defaults to a user
+                // everywhere except the Groups pane, where a group is what
+                // whoever is looking at that list is more likely to want.
+                let creating_group = self.view == View::Groups;
+                let (new_label, new_hover, new_disabled_hover) = if creating_group {
+                    (
+                        "New group…",
+                        "Create a group (Ctrl+N)",
+                        "Enable write mode (Ctrl+Shift+W) to create a group",
+                    )
+                } else {
+                    (
+                        "New user…",
+                        "Create a user account (Ctrl+N)",
+                        "Enable write mode (Ctrl+Shift+W) to create an account",
+                    )
+                };
                 if ui
                     .add_enabled(
                         self.write_mode.is_armed(),
-                        egui::Button::new("New user…"),
+                        egui::Button::new(new_label),
                     )
-                    .on_hover_text("Create a user account (Ctrl+N)")
-                    .on_disabled_hover_text(
-                        "Enable write mode (Ctrl+Shift+W) to create an account",
-                    )
+                    .on_hover_text(new_hover)
+                    .on_disabled_hover_text(new_disabled_hover)
                     .clicked()
                 {
-                    self.new_user();
+                    self.new_user_or_group();
                 }
 
                 // Only when there is somewhere to export to. A button that
@@ -2106,7 +2182,13 @@ impl App {
     }
 
     pub fn refresh_current(&mut self) {
-        if let Some(collection) = self.view.collection() {
+        self.refresh_view(self.view);
+    }
+
+    /// Refresh a specific node, regardless of which one is currently
+    /// selected — what the nav tree's context menu acts on.
+    fn refresh_view(&mut self, view: View) {
+        if let Some(collection) = view.collection() {
             self.store.requested.clear();
             self.send(Command::Load(collection));
         } else {

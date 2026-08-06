@@ -281,6 +281,72 @@ fn row(app: &mut App, ui: &mut egui::Ui, entry: &Entry, index: usize, pane_focus
     {
         toggle(app, key);
     }
+
+    context_menu(app, &response, entry.view);
+}
+
+/// The right-click menu for a scope-tree node.
+///
+/// Collection-level rather than per-object: a tree node has no single record
+/// to act on the way a list row does, so this offers `New user…`/`New
+/// group…` — mirroring the toolbar button — and `Refresh`, for whichever node
+/// was clicked rather than only the one currently selected.
+fn context_menu(app: &mut App, response: &egui::Response, view: View) {
+    let armed = app.write_mode.is_armed();
+
+    egui::Popup::menu(response)
+        .open_memory(if response.secondary_clicked() {
+            Some(egui::SetOpenCommand::Bool(true))
+        } else if response.clicked() {
+            // A plain click dismisses an open menu, same as the list rows.
+            Some(egui::SetOpenCommand::Bool(false))
+        } else {
+            None
+        })
+        .at_pointer_fixed()
+        .show(|ui| {
+            ui.set_min_width(170.0);
+
+            match view {
+                View::Users => {
+                    if ui
+                        .add_enabled(armed, egui::Button::new("New user…"))
+                        .on_disabled_hover_text(
+                            "Enable write mode (Ctrl+Shift+W) to create an account",
+                        )
+                        .clicked()
+                    {
+                        app.new_user();
+                        ui.close();
+                    }
+                    ui.separator();
+                }
+                View::Groups => {
+                    if ui
+                        .add_enabled(armed, egui::Button::new("New group…"))
+                        .on_disabled_hover_text(
+                            "Enable write mode (Ctrl+Shift+W) to create a group",
+                        )
+                        .clicked()
+                    {
+                        app.new_group();
+                        ui.close();
+                    }
+                    ui.separator();
+                }
+                _ => {}
+            }
+
+            let refresh_label = if view == View::Overview {
+                "Refresh all"
+            } else {
+                "Refresh"
+            };
+            if ui.button(refresh_label).clicked() {
+                app.refresh_view(view);
+                ui.close();
+            }
+        });
 }
 
 /// A small solid triangle: pointing right when collapsed, down when expanded.

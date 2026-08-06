@@ -95,6 +95,14 @@ pub enum Command {
         password: crate::mariadb::Secret,
         tables: Vec<crate::mariadb::Table>,
     },
+    /// Ask GitHub for a newer release. Sent once, at startup.
+    CheckForUpdate,
+    /// Download and apply the release, replacing the running install.
+    ///
+    /// On success this ends the process; it does not return to send an
+    /// `Event` of its own. `UpdateApplyFailed` is the only outcome the UI
+    /// ever sees from this command.
+    ApplyUpdate(Box<crate::update::Release>),
 }
 
 /// Results from the worker back to the UI.
@@ -180,6 +188,10 @@ pub enum Event {
     DatabaseProgress { table: String, rows: usize },
     /// A database export finished, successfully or otherwise.
     DatabaseDone(Result<String, String>),
+    /// A newer release than this one is available.
+    UpdateAvailable(Box<crate::update::Release>),
+    /// Applying the update failed; the running install is untouched.
+    UpdateApplyFailed(String),
 }
 
 /// The UI's handle on the worker thread.
@@ -274,6 +286,7 @@ impl<F: Fn()> Reporter<F> {
                 errorlog::info("mariadb", &format!("export wrote {summary}"))
             }
             Event::DatabaseDone(Err(message)) => errorlog::error("mariadb", message),
+            Event::UpdateApplyFailed(message) => errorlog::error("update", message),
             Event::SignedIn {
                 account,
                 writes_available,
@@ -338,9 +351,11 @@ async fn run<F: Fn() + Send + 'static>(
     };
 
     let auth = Authenticator::new(config.clone(), http.clone());
-    // Kept aside before the client takes ownership: the database export needs
-    // the connection details but has nothing to do with Graph.
+    // Kept aside before the client takes ownership: the database export and
+    // the update check both need an HTTP client but have nothing to do with
+    // Graph.
     let config_for_export = config.mariadb.clone();
+    let http_for_update = http.clone();
     let mut client = GraphClient::new(config, http, auth);
 
     // Starts locked on every launch and is never persisted, so a console that
@@ -434,6 +449,12 @@ async fn run<F: Fn() + Send + 'static>(
             }
             Command::ExportToDatabase { password, tables } => {
                 export_to_database(&config_for_export, &reporter, &password, tables).await;
+            }
+            Command::CheckForUpdate => {
+                check_for_update(&http_for_update, &reporter).await;
+            }
+            Command::ApplyUpdate(release) => {
+                apply_update(&http_for_update, &reporter, *release).await;
             }
         }
     }
@@ -607,6 +628,35 @@ async fn export_to_database<F: Fn() + Send + 'static>(
         // to …" or "writing gcm_users" alongside the driver's own message.
         Err(err) => Err(format!("{err:#}")),
     }));
+}
+
+/// Ask GitHub for a newer release. Silent on failure and when there is
+/// nothing newer — a start-up check is not something worth interrupting
+/// anyone over, and the diagnostic log is where a persistent failure would
+/// actually get noticed.
+async fn check_for_update<F: Fn() + Send + 'static>(
+    http: &reqwest::Client,
+    reporter: &Reporter<F>,
+) {
+    match crate::update::check(http).await {
+        Ok(Some(release)) => reporter.send(Event::UpdateAvailable(Box::new(release))),
+        Ok(None) => {}
+        Err(err) => errorlog::warn("update", &format!("{err:#}")),
+    }
+}
+
+/// Download and apply an update. On success this does not return: the
+/// relauncher has taken over and the process exits from inside
+/// [`crate::update::apply`]'s caller here, not from the run loop.
+async fn apply_update<F: Fn() + Send + 'static>(
+    http: &reqwest::Client,
+    reporter: &Reporter<F>,
+    release: crate::update::Release,
+) {
+    match crate::update::apply(http, &release).await {
+        Ok(()) => std::process::exit(0),
+        Err(err) => reporter.send(Event::UpdateApplyFailed(format!("{err:#}"))),
+    }
 }
 
 /// Returns true when sign-in succeeded.

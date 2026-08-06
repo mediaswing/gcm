@@ -122,7 +122,7 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
         app.view_state(view).mark_all_filtered();
     }
     if pressed.new_user {
-        app.new_user();
+        app.new_user_or_group();
     }
     if pressed.import_csv {
         app.open_import();

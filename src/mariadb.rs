@@ -34,10 +34,20 @@
 //! `TEXT`, because a column that is nearly a number is worse than one that is
 //! honestly a string.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use mysql_async::prelude::*;
 
 use crate::config::MariaDb;
+
+/// How long to wait for the initial connection before giving up.
+///
+/// `mysql_async` sets no timeout of its own, so without this an unreachable
+/// host — a wrong bridged-adapter IP, a firewall that drops packets instead
+/// of refusing them — hangs the export forever: no error, nothing written,
+/// and nothing on screen to say either has happened.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A password, which cannot be printed by accident.
 ///
@@ -251,9 +261,16 @@ pub async fn export(
     }
 
     let pool = mysql_async::Pool::new(options);
-    let mut conn = pool
-        .get_conn()
+    let mut conn = tokio::time::timeout(CONNECT_TIMEOUT, pool.get_conn())
         .await
+        .with_context(|| {
+            format!(
+                "connecting to {} timed out after {}s — check the host, port and that \
+                 nothing is silently dropping the connection",
+                settings.describe(),
+                CONNECT_TIMEOUT.as_secs()
+            )
+        })?
         .with_context(|| format!("connecting to {}", settings.describe()))?;
 
     let mut written = Vec::new();

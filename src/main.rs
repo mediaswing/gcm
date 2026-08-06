@@ -22,6 +22,7 @@ mod graph;
 mod mariadb;
 mod importer;
 mod ui;
+mod update;
 mod worker;
 
 use ui::{App, FRIENDLY_NAME};
