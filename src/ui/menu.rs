@@ -142,12 +142,40 @@ impl FormFactory {
     }
 }
 
+/// Something the console does to itself rather than to the tenant.
+///
+/// These exist because every one of them already had a keyboard shortcut and
+/// no other way in. A view that Graph will not let anyone change — a licence, a
+/// past sign-in — still has plenty somebody wants to *do* with it: copy the
+/// row, tick a few, export the list, read it again. Leaving those off the menu
+/// is what made half the console's right-click menus look broken.
+///
+/// Never gated on write mode, because none of it changes anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewCommand {
+    CopyRow,
+    ToggleMark,
+    MarkAllFiltered,
+    ClearMarks,
+    ExportCsv,
+    ExportJson,
+    Refresh,
+}
+
 /// One entry in a menu or button bar.
 pub enum Item {
     /// Runs immediately, subject to confirmation.
     Act { label: String, action: Action },
     /// Opens a form to gather more input first. Labelled with an ellipsis.
     Open { label: String, form: FormFactory },
+    /// Acts on the console rather than the tenant, and is never disabled.
+    View {
+        label: String,
+        /// Shown greyed at the right of the entry, the way a menu names its
+        /// accelerator — these all had shortcuts before they had entries.
+        shortcut: &'static str,
+        command: ViewCommand,
+    },
     /// A visual break; ignored by the button bar.
     Separator,
 }
@@ -165,6 +193,56 @@ impl Item {
             label: label.into(),
             form,
         }
+    }
+
+    fn view(label: &str, shortcut: &'static str, command: ViewCommand) -> Self {
+        Item::View {
+            label: label.into(),
+            shortcut,
+            command,
+        }
+    }
+
+    /// True for the entries that write to the tenant, and so need write mode.
+    pub fn needs_write_mode(&self) -> bool {
+        matches!(self, Item::Act { .. } | Item::Open { .. })
+    }
+
+    /// True for the entries that bring a new object into existence rather than
+    /// acting on the selected one.
+    ///
+    /// The right-click menu wants these — creating an account is an errand
+    /// somebody arrives at the Users node to run, and it does not depend on
+    /// what is selected. A toolbar that already carries a New button one line
+    /// above does not.
+    pub fn creates_object(&self) -> bool {
+        matches!(
+            self,
+            Item::Open {
+                form: FormFactory::CreateUser | FormFactory::CreateGroup,
+                ..
+            }
+        )
+    }
+}
+
+/// What can be *created* from a given node, for the toolbar and the tree menu.
+///
+/// Only two things in the console can be brought into existence, so this is
+/// deliberately narrow. It returns `None` everywhere else rather than falling
+/// back to "New user…", which is what made the button lie about what it would
+/// do on nine of the eleven nodes.
+pub fn creatable(view: View) -> Option<(&'static str, &'static str)> {
+    match view {
+        View::Users => Some((
+            "New user…",
+            "Enable write mode (Ctrl+Shift+W) to create an account",
+        )),
+        View::Groups => Some((
+            "New group…",
+            "Enable write mode (Ctrl+Shift+W) to create a group",
+        )),
+        _ => None,
     }
 }
 
@@ -186,6 +264,60 @@ pub fn for_object(app: &App, view: View, source: usize) -> Vec<Item> {
             Vec::new()
         }
     }
+}
+
+/// Everything offered on a right-click, which is [`for_object`] plus the
+/// things that need no write mode.
+///
+/// Kept separate from `for_object` so the details-pane button bar and the
+/// toolbar go on showing tenant actions only — a Copy button beside Disable
+/// account would be a category error, and the details pane has its own.
+pub fn context_items(app: &App, view: View, source: usize) -> Vec<Item> {
+    let has_marks = app.views.get(&view).is_some_and(|state| state.has_marks());
+    let mut items = for_object(app, view, source);
+    let common = common_items(view, has_marks);
+    if !items.is_empty() && !common.is_empty() {
+        items.push(Item::Separator);
+    }
+    items.extend(common);
+    items
+}
+
+/// The entries every list view offers, whatever it holds.
+///
+/// Takes `has_marks` rather than the whole `App` so the guarantee that matters
+/// — no view is ever left with an empty menu — can be asserted directly.
+fn common_items(view: View, has_marks: bool) -> Vec<Item> {
+    // The console root is a summary with no rows to act on.
+    if view == View::Overview {
+        return Vec::new();
+    }
+
+    let mut items = vec![
+        Item::view("Copy row", "Ctrl+C", ViewCommand::CopyRow),
+        Item::Separator,
+        Item::view("Tick for bulk", "Space", ViewCommand::ToggleMark),
+        Item::view("Tick all shown", "Ctrl+A", ViewCommand::MarkAllFiltered),
+    ];
+
+    // Only worth offering once there is something to clear.
+    if has_marks {
+        items.push(Item::view(
+            "Clear ticks",
+            "Ctrl+Shift+A",
+            ViewCommand::ClearMarks,
+        ));
+    }
+
+    items.push(Item::Separator);
+    items.push(Item::view("Export as CSV…", "Ctrl+E", ViewCommand::ExportCsv));
+    items.push(Item::view(
+        "Export as JSON…",
+        "Ctrl+Shift+E",
+        ViewCommand::ExportJson,
+    ));
+    items.push(Item::view("Refresh", "F5", ViewCommand::Refresh));
+    items
 }
 
 fn user_items(app: &App, source: usize) -> Vec<Item> {
@@ -698,6 +830,8 @@ pub enum Chosen {
     Cancelled,
     Act(Vec<Action>),
     Open(Box<FormFactory>),
+    /// Something that acts on the console rather than the tenant.
+    View(ViewCommand),
 }
 
 impl Palette {
@@ -728,6 +862,13 @@ impl Palette {
             .iter()
             .all(|item| matches!(item, Item::Separator))
             && self.bulk.is_empty()
+    }
+
+    /// True when nothing on offer would survive the write gate — used to decide
+    /// whether the "read-only" warning is worth showing at all. A palette of
+    /// nothing but Copy and Export has no business complaining about it.
+    fn all_read_only(&self) -> bool {
+        self.bulk.is_empty() && !self.items.iter().any(Item::needs_write_mode)
     }
 
     /// Labels that survive the filter, paired with their index in the source.
@@ -764,6 +905,7 @@ impl Palette {
                     action.severity() == Severity::Destructive,
                 )),
                 Item::Open { label, .. } => Some((index, label.clone(), false)),
+                Item::View { label, .. } => Some((index, label.clone(), false)),
             })
             .filter(|(_, label, _)| keep(label))
             .collect()
@@ -788,7 +930,10 @@ pub fn palette(ctx: &egui::Context, palette: &mut Palette, armed: bool) -> Chose
         ui.label(RichText::new(&palette.subject).small().color(super::theme::MUTED));
         ui.add_space(10.0);
 
-        if !armed {
+        // Not shown when nothing here would be gated anyway: telling somebody
+        // the console is read-only above a list of Copy and Export is noise,
+        // and worse, implies those are unavailable too.
+        if !armed && !palette.all_read_only() {
             ui.label(
                 RichText::new("Read-only — press Ctrl+Shift+W to make changes")
                     .small()
@@ -831,8 +976,16 @@ pub fn palette(ctx: &egui::Context, palette: &mut Palette, armed: bool) -> Chose
                         RichText::new(label)
                     };
 
+                    // Only the entries that would write to the tenant are
+                    // gated. Copy and Export are not the write gate's business.
+                    let gated = palette
+                        .items
+                        .get(*source_index)
+                        .is_none_or(Item::needs_write_mode);
                     let response = ui
-                        .add_enabled_ui(armed, |ui| ui.selectable_label(highlighted, text))
+                        .add_enabled_ui(armed || !gated, |ui| {
+                            ui.selectable_label(highlighted, text)
+                        })
                         .inner;
                     if highlighted {
                         response.scroll_to_me(None);
@@ -869,8 +1022,17 @@ pub fn palette(ctx: &egui::Context, palette: &mut Palette, armed: bool) -> Chose
         if up {
             palette.cursor = palette.cursor.saturating_sub(1);
         }
-        if enter && armed && let Some((source_index, _, _)) = matching.get(palette.cursor) {
-            chosen = pick(palette, *source_index);
+        if enter && let Some((source_index, _, _)) = matching.get(palette.cursor) {
+            // Same rule as the click path above: the write gate applies to the
+            // entries that write, not to Copy and Export. A bulk palette has no
+            // `items`, and everything it offers is a write, so it stays gated.
+            let gated = palette
+                .items
+                .get(*source_index)
+                .is_none_or(Item::needs_write_mode);
+            if armed || !gated {
+                chosen = pick(palette, *source_index);
+            }
         }
         if escape {
             chosen = Chosen::Cancelled;
@@ -897,7 +1059,112 @@ fn pick(palette: &mut Palette, index: usize) -> Chosen {
     match std::mem::replace(&mut palette.items[index], Item::Separator) {
         Item::Act { action, .. } => Chosen::Act(vec![action]),
         Item::Open { form, .. } => Chosen::Open(Box::new(form)),
+        Item::View { command, .. } => Chosen::View(command),
         Item::Separator => Chosen::Pending,
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every view, including the console root, so a new one cannot be added
+    /// without this file having an opinion about it.
+    fn every_view() -> Vec<View> {
+        let mut views = vec![View::Overview];
+        views.extend_from_slice(View::ALL);
+        views
+    }
+
+    #[test]
+    fn no_list_view_is_left_with_an_empty_menu() {
+        // The bug this exists to prevent: `for_object` returns nothing for
+        // Roles, Licenses and both logs, so right-clicking those produced a
+        // popup with nothing in it — indistinguishable from a dead menu.
+        for view in every_view() {
+            let items = common_items(view, false);
+            if view == View::Overview {
+                assert!(items.is_empty(), "the console root has no rows to act on");
+                continue;
+            }
+            assert!(
+                items.iter().any(|item| matches!(item, Item::View { .. })),
+                "{view:?} would open an empty context menu"
+            );
+        }
+    }
+
+    #[test]
+    fn the_common_entries_never_need_write_mode() {
+        // They are the whole reason a read-only view now has a usable menu; a
+        // single gated entry among them would put it back where it was.
+        for view in every_view() {
+            for item in common_items(view, true) {
+                assert!(
+                    !item.needs_write_mode(),
+                    "{view:?} offers a common entry that the write gate would disable"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clearing_ticks_is_offered_only_once_there_are_ticks() {
+        let labels = |has_marks| {
+            common_items(View::Users, has_marks)
+                .iter()
+                .filter_map(|item| match item {
+                    Item::View { label, .. } => Some(label.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(!labels(false).iter().any(|l| l.contains("Clear")));
+        assert!(labels(true).iter().any(|l| l.contains("Clear")));
+    }
+
+    #[test]
+    fn only_users_and_groups_can_be_created() {
+        // The toolbar used to offer "New user…" from every node, including
+        // Licenses and the logs, where it named the wrong object entirely.
+        assert!(creatable(View::Users).is_some());
+        assert!(creatable(View::Groups).is_some());
+        for view in every_view() {
+            if matches!(view, View::Users | View::Groups) {
+                continue;
+            }
+            assert!(
+                creatable(view).is_none(),
+                "{view:?} offers a New button for something it cannot create"
+            );
+        }
+    }
+
+    #[test]
+    fn only_tenant_actions_answer_to_the_write_gate() {
+        assert!(Item::act("Delete", Action::DeleteUser {
+            id: "x".into(),
+            name: "x".into(),
+        })
+        .needs_write_mode());
+        assert!(Item::open("New user…", FormFactory::CreateUser).needs_write_mode());
+        assert!(!Item::view("Copy row", "Ctrl+C", ViewCommand::CopyRow).needs_write_mode());
+    }
+
+    #[test]
+    fn creating_is_told_apart_from_acting_on_the_selection() {
+        // The toolbar filters these out because it carries a New button of its
+        // own; the right-click menu keeps them.
+        assert!(Item::open("New user…", FormFactory::CreateUser).creates_object());
+        assert!(Item::open("New group…", FormFactory::CreateGroup).creates_object());
+        assert!(
+            !Item::open("Edit…", FormFactory::ResetPassword {
+                id: "x".into(),
+                name: "x".into(),
+            })
+            .creates_object()
+        );
+        assert!(!Item::view("Copy row", "Ctrl+C", ViewCommand::CopyRow).creates_object());
+    }
+}

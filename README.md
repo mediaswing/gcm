@@ -199,7 +199,12 @@ or is revoked. Both files live in one owner-controlled directory so there is
 exactly one place to protect. `.gitignore` covers `config.ini` and `token.json`
 in case a working copy ever lands in the tree.
 
-**Sign out** in the toolbar deletes the cached token and forces a fresh sign-in.
+**Sign out** in the toolbar forgets the identity completely: the cached refresh
+token on disk, the tokens held in memory, and — via `prompt=select_account` on
+the next authorization request — Entra's own opinion about who you are. Without
+that last part the browser's existing session signs the same person straight
+back in before anyone can read the redirect, which is exactly what made Sign
+out appear to do nothing before v1.3.1.
 
 ## Signing in
 
@@ -276,7 +281,8 @@ destroyed — which is the mistake that actually happens.
 
 ### Creating a user
 
-`Ctrl+N` from anywhere, or the **New user…** button in the toolbar. The form
+`Ctrl+N` from the Users node, the **New user…** button in the toolbar, or
+right-clicking the Users node in the scope tree. The form
 asks for a display name and a sign-in name, splitting the latter into an alias
 and a domain chosen from the tenant's *verified* domains — Graph rejects
 anything else, and picking from a list cannot be got wrong.
@@ -592,13 +598,24 @@ parent first, so nothing is unreachable.
 | `Shift+F10` | Open the actions menu for the selection — the keyboard equivalent of right-clicking |
 | `Ctrl+Enter` | The same, for keyboards where F10 is claimed by the window manager |
 | `Ctrl+Shift+W` | Turn write mode on or off |
-| `Ctrl+N` | Create a user account, from anywhere |
+| `Ctrl+N` | Create — a user on the Users node, a group on Groups |
 | `Ctrl+Shift+D` | Export every loaded view to MariaDB |
 
-The actions menu, the right-click menu and the details pane buttons all render
-from one list, so they cannot offer different things. The menu opens even while
-read-only, with entries disabled — seeing what is possible should not require
-arming write mode first.
+The actions menu, the right-click menu, the toolbar's second row and the details
+pane buttons all render from one list, so they cannot offer different things.
+The menu opens even while read-only, with the entries that change the tenant
+disabled — seeing what is possible should not require arming write mode first.
+
+Every view's menu also carries the things that need no write mode at all: copy
+the row, tick rows for a bulk operation, export the view, refresh it. That
+matters most on the views Graph will not let anyone change — Directory Roles,
+Licenses and both logs — which before v1.3.1 opened a menu with nothing in it,
+and so looked broken rather than read-only.
+
+Buttons follow the node. **New user…** appears on Users, **New group…** on
+Groups, and on the nodes where nothing can be created the slot carries
+**Export…** instead. A second row appears beneath the toolbar when a row is
+selected, carrying what can be done to it — or to the whole ticked set.
 
 **Inside a dialog**
 
