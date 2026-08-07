@@ -10,6 +10,20 @@ someone reading the diff.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 gcm uses [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-08-07
+
+### Fixed
+
+- The failure screen's **Open the configuration folder** button opened
+  `%APPDATA%\gcm` on Windows, which has never held the configuration — that
+  lives in the registry there, and the folder holds only the logs **Open the
+  error log** already reaches. It now only appears on the platforms where the
+  folder is actually where the configuration lives.
+- The self-update relauncher's batch script did not escape `%` in the install
+  and temp paths it interpolates, so a directory with a literal `%` in its
+  name could be misread by cmd.exe as a `%VAR%` expansion partway through the
+  copy.
+
 ## [1.6.0] - 2026-08-07
 
 ### Added
@@ -166,7 +180,8 @@ gcm uses [semantic versioning](https://semver.org/spec/v2.0.0.html).
 - A release workflow building a signed `.app` bundle on macOS and bundling the
   VC++ runtime on Windows.
 
-[Unreleased]: https://github.com/mediaswing/gcm/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/mediaswing/gcm/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/mediaswing/gcm/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/mediaswing/gcm/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/mediaswing/gcm/compare/v1.3.0...v1.5.0
 [1.3.0]: https://github.com/mediaswing/gcm/compare/v1.2.0...v1.3.0
