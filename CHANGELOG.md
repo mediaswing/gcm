@@ -10,7 +10,7 @@ someone reading the diff.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 gcm uses [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.6.0] - 2026-08-07
 
 ### Added
 
@@ -166,7 +166,8 @@ gcm uses [semantic versioning](https://semver.org/spec/v2.0.0.html).
 - A release workflow building a signed `.app` bundle on macOS and bundling the
   VC++ runtime on Windows.
 
-[Unreleased]: https://github.com/mediaswing/gcm/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/mediaswing/gcm/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/mediaswing/gcm/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/mediaswing/gcm/compare/v1.3.0...v1.5.0
 [1.3.0]: https://github.com/mediaswing/gcm/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/mediaswing/gcm/compare/v1.1.0...v1.2.0

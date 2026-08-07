@@ -1,6 +1,6 @@
 [package]
 name = "gcm"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2024"
 description = "Graphical Cloud Manager — an MMC-style Microsoft 365 admin console"
 license = "MIT"
