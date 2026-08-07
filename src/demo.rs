@@ -695,6 +695,10 @@ pub fn directory() -> crate::config::Directory {
         port: 636,
         base_dn: "DC=corp,DC=contoso,DC=co,DC=uk".into(),
         bind_dn: "CORP\\svc-gcm".into(),
+        // Simple explicitly, not the platform default: demo mode hands the
+        // worker a fake password, and the bind dialog is one of the things
+        // this fixture exists to exercise.
+        auth: crate::config::DirectoryAuth::Simple,
         tls: true,
         start_tls: false,
     }

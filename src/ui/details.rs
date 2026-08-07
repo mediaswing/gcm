@@ -45,6 +45,18 @@ fn action_bar(app: &mut App, ui: &mut egui::Ui, source: usize) {
                         app.request_action(action);
                     }
                 }
+                menu::Item::ActDirectory { label, action } => {
+                    let destructive = action.severity() == Severity::Destructive;
+                    let text = if destructive {
+                        RichText::new(&label)
+                            .color(if armed { theme::BAD } else { theme::MUTED })
+                    } else {
+                        RichText::new(&label)
+                    };
+                    if enabled_button(ui, armed, egui::Button::new(text)) {
+                        app.request_directory_action(*action);
+                    }
+                }
                 menu::Item::Open { label, form } => {
                     if enabled_button(ui, armed, egui::Button::new(&label)) {
                         app.open_form(form.build());

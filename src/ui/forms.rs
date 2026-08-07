@@ -14,6 +14,8 @@ use super::{Store, theme};
 use crate::graph::actions::{
     Action, AutoReplySpec, DeviceOp, GroupPatch, GroupSpec, MemberRole, UserPatch, UserSpec,
 };
+use crate::ldap::actions::{AdUserPatch, DirectoryAction};
+use crate::mariadb::Secret;
 
 /// Length of a generated password. Long enough to satisfy any tenant policy
 /// without the operator having to think about it.
@@ -52,6 +54,53 @@ pub enum Outcome {
     Cancelled,
     /// The operator submitted; route this through confirmation.
     Submit(Box<Action>),
+    /// The same, for a change to the on-premises domain.
+    SubmitDirectory(Box<DirectoryAction>),
+}
+
+/// Editable text for an on-premises account.
+///
+/// Held as strings for the same reason [`UserFields`] is, but the meaning of
+/// an empty one differs: Active Directory has no attribute that is present and
+/// empty, so clearing a field removes the attribute outright.
+#[derive(Default, Clone)]
+pub struct AdFields {
+    pub display_name: String,
+    pub description: String,
+    pub title: String,
+    pub department: String,
+    pub company: String,
+    pub office: String,
+    pub telephone: String,
+    pub mobile: String,
+    pub mail: String,
+    pub employee_id: String,
+}
+
+impl AdFields {
+    /// The patch these fields describe, relative to what was loaded.
+    ///
+    /// Only genuinely changed values are included. Sending every field on
+    /// every save would rewrite attributes the operator never touched, which
+    /// on a delegated account is the difference between a change that is
+    /// permitted and one that is refused wholesale.
+    fn patch_against(&self, original: &AdFields) -> AdUserPatch {
+        fn changed(now: &str, before: &str) -> Option<String> {
+            (now.trim() != before.trim()).then(|| now.trim().to_string())
+        }
+        AdUserPatch {
+            display_name: changed(&self.display_name, &original.display_name),
+            description: changed(&self.description, &original.description),
+            title: changed(&self.title, &original.title),
+            department: changed(&self.department, &original.department),
+            company: changed(&self.company, &original.company),
+            office: changed(&self.office, &original.office),
+            telephone: changed(&self.telephone, &original.telephone),
+            mobile: changed(&self.mobile, &original.mobile),
+            mail: changed(&self.mail, &original.mail),
+            employee_id: changed(&self.employee_id, &original.employee_id),
+        }
+    }
 }
 
 /// Editable text for a user, held as strings because that is what a text field
@@ -103,6 +152,26 @@ pub enum Form {
         id: String,
         name: String,
         fields: UserFields,
+    },
+    /// Reset an on-premises password.
+    ///
+    /// Separate from [`Form::ResetPassword`] rather than reusing it, because
+    /// the two land in different directories and say different things: this
+    /// one can force a change at next sign-in, which is an Active Directory
+    /// concept, and it warns about sync rather than about the tenant.
+    AdResetPassword {
+        dn: String,
+        name: String,
+        password: String,
+        must_change: bool,
+    },
+    /// Edit an on-premises account's ordinary attributes.
+    AdEditUser {
+        dn: String,
+        name: String,
+        fields: Box<AdFields>,
+        /// What was loaded, so only genuine edits are sent.
+        original: Box<AdFields>,
     },
     ResetPassword {
         id: String,
@@ -167,6 +236,17 @@ impl Form {
         }
     }
 
+    pub fn ad_reset_password(dn: String, name: String) -> Self {
+        Form::AdResetPassword {
+            dn,
+            name,
+            password: generate_password(),
+            // Defaulting to on: an administratively reset password is a
+            // temporary one somebody has just been told over the phone.
+            must_change: true,
+        }
+    }
+
     pub fn create_user() -> Self {
         Form::CreateUser {
             fields: Box::new(NewUserFields {
@@ -222,6 +302,10 @@ impl Form {
             }
             Form::EditUser { name, .. } => format!("Edit {name}"),
             Form::ResetPassword { name, .. } => format!("Reset the password for {name}"),
+            Form::AdResetPassword { name, .. } => {
+                format!("Reset the on-premises password for {name}")
+            }
+            Form::AdEditUser { name, .. } => format!("Edit {name} in Active Directory"),
             Form::CreateGroup { .. } => "Create a group".into(),
             Form::EditGroup { name, .. } => format!("Edit {name}"),
             Form::PickLicense {
@@ -295,6 +379,22 @@ pub fn show(ctx: &egui::Context, form: &mut Form, store: &Store) -> Outcome {
             }
             Form::ResetPassword { id, name, password } => {
                 reset_password(ui, id, name, password, &mut outcome);
+            }
+            Form::AdResetPassword {
+                dn,
+                name,
+                password,
+                must_change,
+            } => {
+                ad_reset_password(ui, dn, name, password, must_change, &mut outcome);
+            }
+            Form::AdEditUser {
+                dn,
+                name,
+                fields,
+                original,
+            } => {
+                ad_edit_user(ui, dn, name, fields, original, &mut outcome);
             }
             Form::CreateGroup {
                 display_name,
@@ -819,6 +919,124 @@ fn reset_password(
             id: id.to_string(),
             name: name.to_string(),
             password: password.clone(),
+        }));
+    }
+}
+
+/// Reset an on-premises password.
+fn ad_reset_password(
+    ui: &mut egui::Ui,
+    dn: &str,
+    name: &str,
+    password: &mut String,
+    must_change: &mut bool,
+    outcome: &mut Outcome,
+) {
+    ui.label(
+        RichText::new(format!("A new password will be set for {name} in Active Directory."))
+            .color(theme::MUTED),
+    );
+    ui.add_space(4.0);
+    ui.label(RichText::new(dn).small().monospace().color(theme::MUTED));
+    ui.add_space(10.0);
+
+    egui::Frame::group(ui.style())
+        .fill(ui.visuals().extreme_bg_color)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(password.as_str()).monospace().size(15.0));
+        });
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if ui.button("Copy").clicked() {
+            ui.ctx().copy_text(password.clone());
+        }
+        if ui.button("Generate another").clicked() {
+            *password = generate_password();
+        }
+    });
+
+    ui.add_space(10.0);
+    ui.checkbox(must_change, "Require a change at next sign-in");
+
+    ui.add_space(10.0);
+    ui.label(
+        RichText::new(
+            "Copy it now — gcm does not store it, and it cannot be shown again once \
+             this dialog closes. The domain's own complexity and history rules still \
+             apply, and the domain controller will refuse a password that breaks them.",
+        )
+        .small()
+        .color(theme::WARN),
+    );
+
+    if buttons(ui, "Reset password", true, outcome) {
+        *outcome = Outcome::SubmitDirectory(Box::new(DirectoryAction::ResetPassword {
+            dn: dn.to_string(),
+            name: name.to_string(),
+            password: Secret::new(password.clone()),
+            must_change: *must_change,
+        }));
+    }
+}
+
+/// Edit an on-premises account's ordinary attributes.
+fn ad_edit_user(
+    ui: &mut egui::Ui,
+    dn: &str,
+    name: &str,
+    fields: &mut AdFields,
+    original: &AdFields,
+    outcome: &mut Outcome,
+) {
+    ui.label(RichText::new(dn).small().monospace().color(theme::MUTED));
+    ui.add_space(10.0);
+
+    egui::Grid::new("ad-edit-user")
+        .num_columns(2)
+        .spacing([12.0, 8.0])
+        .show(ui, |ui| {
+            for (label, value) in [
+                ("Display name", &mut fields.display_name),
+                ("Description", &mut fields.description),
+                ("Job title", &mut fields.title),
+                ("Department", &mut fields.department),
+                ("Company", &mut fields.company),
+                ("Office", &mut fields.office),
+                ("Telephone", &mut fields.telephone),
+                ("Mobile", &mut fields.mobile),
+                ("Email", &mut fields.mail),
+                ("Employee ID", &mut fields.employee_id),
+            ] {
+                ui.label(label);
+                ui.add(
+                    egui::TextEdit::singleline(value).desired_width(f32::INFINITY),
+                );
+                ui.end_row();
+            }
+        });
+
+    let patch = fields.patch_against(original);
+    let changed = !patch.is_empty();
+
+    ui.add_space(10.0);
+    ui.label(
+        RichText::new(if changed {
+            "Only the fields you changed are written. Clearing one removes the \
+             attribute — Active Directory does not store an empty value."
+        } else {
+            "Nothing has been changed yet."
+        })
+        .small()
+        .color(theme::MUTED),
+    );
+
+    if buttons(ui, "Save", changed, outcome) {
+        *outcome = Outcome::SubmitDirectory(Box::new(DirectoryAction::UpdateUser {
+            dn: dn.to_string(),
+            name: name.to_string(),
+            patch: Box::new(patch),
         }));
     }
 }

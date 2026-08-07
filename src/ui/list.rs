@@ -916,6 +916,17 @@ fn context_menu(app: &mut App, response: &egui::Response, view: View, source: us
                         ui.close();
                     }
                 }
+                menu::Item::ActDirectory { label, action } => {
+                    let text = if action.severity() == Severity::Destructive {
+                        RichText::new(&label).color(theme::BAD)
+                    } else {
+                        RichText::new(&label)
+                    };
+                    if ui.add_enabled(armed, egui::Button::new(text)).clicked() {
+                        app.request_directory_action(*action);
+                        ui.close();
+                    }
+                }
                 menu::Item::Open { label, form } => {
                     if ui.add_enabled(armed, egui::Button::new(&label)).clicked() {
                         app.open_form(form.build());

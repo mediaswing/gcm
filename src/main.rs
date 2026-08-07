@@ -22,6 +22,15 @@ mod graph;
 mod ldap;
 mod mariadb;
 mod importer;
+// The schema and INI rendering compile everywhere so `cargo test` can cover
+// them on any platform; only the calls into the registry itself are Windows-
+// only. That leaves the pure half genuinely unused in a non-Windows build,
+// which is the intent rather than an oversight.
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only the tests exercise this off Windows")
+)]
+mod registry;
 mod ui;
 mod update;
 mod worker;

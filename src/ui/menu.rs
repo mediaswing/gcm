@@ -10,11 +10,12 @@
 //! [`FormFactory`]; the caller routes them through `request_actions` or
 //! `open_form`, which is where the write gate and confirmation live.
 
-use super::forms::{Form, UserFields};
+use super::forms::{AdFields, Form, UserFields};
 use super::{App, View};
 use crate::graph::Fetch;
 use crate::graph::actions::{Action, AutoReplySpec, DeviceOp, MemberRole, Severity, TeamOp};
 use crate::graph::models::AutomaticReplies;
+use crate::ldap::actions::DirectoryAction;
 
 /// Which form an item opens, built lazily so the store is not borrowed while
 /// the menu is still being drawn from it.
@@ -61,6 +62,17 @@ pub enum FormFactory {
     RenameDevice {
         id: String,
         name: String,
+    },
+    /// Reset an on-premises password.
+    AdResetPassword {
+        dn: String,
+        name: String,
+    },
+    /// Edit an on-premises account, seeded with what is on it now.
+    AdEditUser {
+        dn: String,
+        name: String,
+        fields: Box<AdFields>,
     },
 }
 
@@ -138,6 +150,15 @@ impl FormFactory {
                 name: name.clone(),
                 new_name: name,
             },
+            FormFactory::AdResetPassword { dn, name } => Form::ad_reset_password(dn, name),
+            FormFactory::AdEditUser { dn, name, fields } => Form::AdEditUser {
+                dn,
+                name,
+                // Two copies: one the operator edits, one to diff against, so
+                // only genuinely changed attributes are written.
+                fields: fields.clone(),
+                original: fields,
+            },
         }
     }
 }
@@ -166,6 +187,15 @@ pub enum ViewCommand {
 pub enum Item {
     /// Runs immediately, subject to confirmation.
     Act { label: String, action: Action },
+    /// The same, but against the on-premises domain rather than the tenant.
+    ///
+    /// A separate variant rather than a shared one because the two go to
+    /// different places and carry different types; everything downstream —
+    /// the write gate, the confirmation, the audit log — treats them alike.
+    ActDirectory {
+        label: String,
+        action: Box<DirectoryAction>,
+    },
     /// Opens a form to gather more input first. Labelled with an ellipsis.
     Open { label: String, form: FormFactory },
     /// Acts on the console rather than the tenant, and is never disabled.
@@ -188,6 +218,13 @@ impl Item {
         }
     }
 
+    fn act_directory(label: &str, action: DirectoryAction) -> Self {
+        Item::ActDirectory {
+            label: label.into(),
+            action: Box::new(action),
+        }
+    }
+
     fn open(label: &str, form: FormFactory) -> Self {
         Item::Open {
             label: label.into(),
@@ -205,7 +242,10 @@ impl Item {
 
     /// True for the entries that write to the tenant, and so need write mode.
     pub fn needs_write_mode(&self) -> bool {
-        matches!(self, Item::Act { .. } | Item::Open { .. })
+        matches!(
+            self,
+            Item::Act { .. } | Item::ActDirectory { .. } | Item::Open { .. }
+        )
     }
 
     /// True for the entries that bring a new object into existence rather than
@@ -255,23 +295,133 @@ pub fn for_object(app: &App, view: View, source: usize) -> Vec<Item> {
         View::ManagedDevices => managed_items(app, source),
         View::Teams => team_items(app, source),
         View::Mailboxes => mailbox_items(app, source),
+        View::AdUsers => ad_user_items(app, source),
+        View::AdComputers => ad_computer_items(app, source),
         // Roles and licences are read-only surfaces: role assignment is done
         // by editing the role's members, and licences by editing a user.
         //
         // The logs are read-only in a stronger sense — there is nothing in
         // Graph that could change a past sign-in, and there should not be.
-        //
-        // The on-premises views are read-only in the strongest sense of all:
-        // this release binds to the DC for reads and never asks it to change
-        // anything, so there is no AD action to offer here.
-        View::Roles
-        | View::Licenses
-        | View::Overview
-        | View::SignIns
-        | View::AuditLogs
-        | View::AdUsers
-        | View::AdComputers => Vec::new(),
+        View::Roles | View::Licenses | View::Overview | View::SignIns | View::AuditLogs => {
+            Vec::new()
+        }
     }
+}
+
+/// The rows of a collection that has loaded, or nothing.
+fn ready<T>(fetch: &Option<Fetch<std::sync::Arc<Vec<T>>>>) -> &[T] {
+    match fetch {
+        Some(Fetch::Ready(items)) => items.as_slice(),
+        _ => &[],
+    }
+}
+
+/// What can be done to an on-premises account.
+///
+/// Everything here is subject to two gates rather than one: gcm's write mode,
+/// and Active Directory's own access check on the bound identity. Offering an
+/// entry the operator turns out not to be delegated is deliberate — the
+/// console cannot know what they may do without asking the DC, and a refusal
+/// says so clearly. Hiding them would mean guessing, and guessing wrong in the
+/// direction of "you cannot do this" is worse.
+fn ad_user_items(app: &App, source: usize) -> Vec<Item> {
+    let Some(user) = ready(&app.store.ad_users).get(source) else {
+        return Vec::new();
+    };
+
+    let dn = user.dn.clone();
+    let name = user.name().to_string();
+    let mut items = Vec::new();
+
+    // Offered in the direction that would change something: a disabled
+    // account gets "Enable", an enabled one gets "Disable". Showing both would
+    // make one of them a no-op that still writes an audit line.
+    let enabling = user.is_disabled();
+    items.push(Item::act_directory(
+        if enabling { "Enable account" } else { "Disable account" },
+        DirectoryAction::SetEnabled {
+            dn: dn.clone(),
+            name: name.clone(),
+            enabled: enabling,
+        },
+    ));
+
+    if user.is_locked_out() {
+        items.push(Item::act_directory(
+            "Unlock account",
+            DirectoryAction::Unlock {
+                dn: dn.clone(),
+                name: name.clone(),
+            },
+        ));
+    }
+
+    items.push(Item::open(
+        "Reset password…",
+        FormFactory::AdResetPassword {
+            dn: dn.clone(),
+            name: name.clone(),
+        },
+    ));
+    items.push(Item::open(
+        "Edit attributes…",
+        FormFactory::AdEditUser {
+            dn: dn.clone(),
+            name: name.clone(),
+            fields: Box::new(AdFields {
+                display_name: user.display_name.clone().unwrap_or_default(),
+                description: user.description.clone().unwrap_or_default(),
+                title: user.title.clone().unwrap_or_default(),
+                department: user.department.clone().unwrap_or_default(),
+                company: user.company.clone().unwrap_or_default(),
+                office: user.office.clone().unwrap_or_default(),
+                telephone: user.telephone.clone().unwrap_or_default(),
+                mobile: user.mobile.clone().unwrap_or_default(),
+                mail: user.mail.clone().unwrap_or_default(),
+                employee_id: user.employee_id.clone().unwrap_or_default(),
+            }),
+        },
+    ));
+    items.push(Item::Separator);
+    items.push(Item::act_directory(
+        "Delete account",
+        DirectoryAction::Delete { dn, name },
+    ));
+
+    items
+}
+
+/// What can be done to an on-premises computer.
+///
+/// A shorter list than a user's, because most of what an account offers makes
+/// no sense here: a computer's password is managed by the machine itself, and
+/// it cannot be locked out by somebody mistyping at a sign-in prompt.
+fn ad_computer_items(app: &App, source: usize) -> Vec<Item> {
+    let Some(computer) = ready(&app.store.ad_computers).get(source) else {
+        return Vec::new();
+    };
+
+    let dn = computer.dn.clone();
+    let name = computer.name().to_string();
+    let mut items = Vec::new();
+
+    let enabling = computer.is_disabled();
+    items.push(Item::act_directory(
+        if enabling { "Enable computer" } else { "Disable computer" },
+        DirectoryAction::SetEnabled {
+            dn: dn.clone(),
+            name: name.clone(),
+            enabled: enabling,
+        },
+    ));
+
+    items.push(Item::Separator);
+    items.push(Item::act_directory(
+        "Delete computer",
+        DirectoryAction::Delete { dn, name },
+    ));
+
+    items
 }
 
 /// Everything offered on a right-click, which is [`for_object`] plus the
@@ -840,6 +990,8 @@ pub enum Chosen {
     Pending,
     Cancelled,
     Act(Vec<Action>),
+    /// One on-premises change, never batched.
+    ActDirectory(Box<DirectoryAction>),
     Open(Box<FormFactory>),
     /// Something that acts on the console rather than the tenant.
     View(ViewCommand),
@@ -911,6 +1063,11 @@ impl Palette {
                 // Separators are structure, not choices; they never take focus.
                 Item::Separator => None,
                 Item::Act { label, action } => Some((
+                    index,
+                    label.clone(),
+                    action.severity() == Severity::Destructive,
+                )),
+                Item::ActDirectory { label, action } => Some((
                     index,
                     label.clone(),
                     action.severity() == Severity::Destructive,
@@ -1069,6 +1226,7 @@ fn pick(palette: &mut Palette, index: usize) -> Chosen {
     // Swap a placeholder in so the item can be moved out by value.
     match std::mem::replace(&mut palette.items[index], Item::Separator) {
         Item::Act { action, .. } => Chosen::Act(vec![action]),
+        Item::ActDirectory { action, .. } => Chosen::ActDirectory(action),
         Item::Open { form, .. } => Chosen::Open(Box::new(form)),
         Item::View { command, .. } => Chosen::View(command),
         Item::Separator => Chosen::Pending,
@@ -1161,6 +1319,20 @@ mod tests {
         .needs_write_mode());
         assert!(Item::open("New user…", FormFactory::CreateUser).needs_write_mode());
         assert!(!Item::view("Copy row", "Ctrl+C", ViewCommand::CopyRow).needs_write_mode());
+        // An on-premises change answers to the gate exactly as a tenant one
+        // does. Missing this would leave the palette offering AD entries as
+        // enabled while write mode is off, and refusing them on click.
+        assert!(
+            Item::act_directory(
+                "Disable account",
+                DirectoryAction::SetEnabled {
+                    dn: "CN=a,DC=b".into(),
+                    name: "a".into(),
+                    enabled: false,
+                }
+            )
+            .needs_write_mode()
+        );
     }
 
     #[test]

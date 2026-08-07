@@ -1,22 +1,36 @@
-//! Configuration loaded from the user directory.
+//! Configuration, and where each platform keeps it.
 //!
-//! The file is INI-shaped (`[section]` headers, `key = "value"` pairs), which
-//! TOML parses natively — so the familiar layout costs us no extra parser,
-//! beyond accepting `;` comments as well as `#`.
+//! The settings are INI-shaped (`[section]` headers, `key = "value"` pairs),
+//! which TOML parses natively — so the familiar layout costs us no extra
+//! parser, beyond accepting `;` comments as well as `#`.
 //!
-//! It deliberately lives in the user's config directory rather than next to the
-//! binary. Neither the client ID nor the tenant ID is a secret (a public
-//! client's ID travels in plaintext on every authorization request, and the
-//! tenant ID is discoverable from any verified domain), but the refresh token
-//! cached alongside it *is* a bearer credential — see [`crate::auth`], which
-//! writes it 0600. Keeping both in one owner-controlled directory means there is
-//! exactly one place to protect, and no chance of committing either to a repo.
+//! **On Windows they live in the registry**, under
+//! `HKEY_CURRENT_USER\Software\gcm`, because a registry key can be deployed by
+//! Group Policy and a file in a user profile cannot. See [`crate::registry`],
+//! which renders those values back into the same INI text this module parses —
+//! so there is one parser, one set of defaults and one `validate` regardless of
+//! where the settings came from. Everywhere else it is `config.ini` in the
+//! user's config directory.
 //!
-//! **Nothing in this file is a secret, and that is a property worth keeping.**
-//! The database export was the first thing that wanted to break it; instead of
-//! storing a password here, gcm asks for one per session and holds it in
-//! memory. The file therefore stays safe to paste into a support ticket, which
-//! is exactly what somebody does when a tenant will not load.
+//! The file form deliberately lives in the user's config directory rather than
+//! next to the binary. Neither the client ID nor the tenant ID is a secret (a
+//! public client's ID travels in plaintext on every authorization request, and
+//! the tenant ID is discoverable from any verified domain), but the refresh
+//! token cached alongside it *is* a bearer credential — see [`crate::auth`],
+//! which writes it 0600. Keeping both in one owner-controlled directory means
+//! there is exactly one place to protect, and no chance of committing either to
+//! a repo.
+//!
+//! **Nothing here is a secret, and that is a property worth keeping.** The
+//! database export was the first thing that wanted to break it; instead of
+//! storing a password, gcm asks for one per session and holds it in memory. The
+//! configuration therefore stays safe to paste into a support ticket, which is
+//! exactly what somebody does when a tenant will not load — and is why the
+//! registry backend offers [`crate::registry::export_ini`], since a registry
+//! key cannot be pasted anywhere useful.
+//!
+//! The two logs are not affected by any of this: `error.log` and `actions.log`
+//! stay files in gcm's own directory on every platform.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -134,9 +148,17 @@ pub struct Directory {
     /// `DC=corp,DC=contoso,DC=com`. Narrow it to an OU to read only part of
     /// the domain.
     pub base_dn: String,
-    /// Who to bind as. Accepts any form the DC does: a full DN, `DOMAIN\user`,
-    /// or a UPN. A read-only account is enough for everything gcm does here.
+    /// Who to bind as for a simple bind. Accepts any form the DC does: a full
+    /// DN, `DOMAIN\user`, or a UPN.
+    ///
+    /// Unused — and not required — under [`DirectoryAuth::Integrated`], where
+    /// the identity is the signed-in Windows account and there is nothing to
+    /// name.
+    #[serde(default)]
     pub bind_dn: String,
+    /// How to authenticate to the domain controller.
+    #[serde(default = "default_directory_auth")]
+    pub auth: DirectoryAuth,
     /// Use LDAPS. On by default, and off is a genuinely bad idea: a simple bind
     /// puts the password on the wire in the clear.
     #[serde(default = "default_true")]
@@ -145,6 +167,41 @@ pub struct Directory {
     /// LDAPS port. Some domains publish only 389.
     #[serde(default)]
     pub start_tls: bool,
+}
+
+/// How gcm proves who it is to a domain controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DirectoryAuth {
+    /// Bind as the signed-in Windows account over Kerberos, via SSPI.
+    ///
+    /// This is the point of the whole setting: the connection carries the
+    /// operator's own identity, so whatever they have been delegated in AD —
+    /// an OU they may reset passwords in, a group they may edit — is exactly
+    /// what gcm can do, without a shared service account standing in for
+    /// everybody and flattening the distinction.
+    ///
+    /// Windows only. Nothing to type, and no password anywhere.
+    Integrated,
+    /// Bind with the `bind_dn` and a password typed once per session.
+    ///
+    /// Everything gcm does then carries that account's rights rather than the
+    /// operator's, which is why it is not the default where the alternative
+    /// exists.
+    Simple,
+}
+
+/// Integrated where it works, simple everywhere else.
+///
+/// Defaulting rather than requiring the setting means a Windows install that
+/// never touches its configuration gets per-operator permissions, which is the
+/// behaviour worth having by default.
+fn default_directory_auth() -> DirectoryAuth {
+    if cfg!(windows) {
+        DirectoryAuth::Integrated
+    } else {
+        DirectoryAuth::Simple
+    }
 }
 
 /// The LDAPS port. Deliberately not 389 — the default should be the encrypted
@@ -168,11 +225,27 @@ impl Directory {
         format!("{scheme}://{}:{}", self.host, self.port)
     }
 
+    /// Whether this connection authenticates as the signed-in Windows user.
+    ///
+    /// Deliberately just the setting, with no `cfg!(windows)` in it. The
+    /// platform check lives in exactly one place — the bind itself, which
+    /// refuses outright off Windows — and `validate` rejects the combination
+    /// long before that. Folding the platform in here as well would mean every
+    /// error message and every dialog silently describing a simple bind while
+    /// the configuration asked for an integrated one.
+    pub fn uses_integrated_auth(&self) -> bool {
+        self.auth == DirectoryAuth::Integrated
+    }
+
     /// The connection as it is safe to print. There is no password on this
     /// struct to leak, but the same accessor exists on [`MariaDb`] and the
     /// dialogs use them interchangeably.
     pub fn describe(&self) -> String {
-        format!("{}@{}:{}", self.bind_dn, self.host, self.port)
+        if self.uses_integrated_auth() {
+            format!("the signed-in Windows account @{}:{}", self.host, self.port)
+        } else {
+            format!("{}@{}:{}", self.bind_dn, self.host, self.port)
+        }
     }
 
     /// How the connection is secured, for the bind dialog to say out loud.
@@ -185,14 +258,29 @@ impl Directory {
     }
 
     fn validate(&self) -> Result<()> {
-        let path = config_path();
         if self.host.trim().is_empty() {
-            bail!("`host` is not set in the [directory] section of {}", path.display());
+            bail!("`host` is not set in the [directory] section of {}", source_label());
         }
-        if self.bind_dn.trim().is_empty() {
+        // Integrated authentication has no bind DN to set — the identity is
+        // whoever is signed in — so it is required only for a simple bind.
+        if self.auth == DirectoryAuth::Simple && self.bind_dn.trim().is_empty() {
             bail!(
-                "`bind_dn` is not set in the [directory] section of {}",
-                path.display()
+                "`bind_dn` is not set in the [directory] section of {}. It is required \
+                 for auth = \"simple\"; on Windows, auth = \"integrated\" binds as the \
+                 signed-in account instead and needs no bind_dn.",
+                source_label()
+            );
+        }
+        // Refused rather than silently downgraded to a simple bind. A
+        // configuration asking for the operator's own permissions, quietly
+        // given a service account's instead, is exactly the kind of difference
+        // nobody discovers until it matters.
+        if self.auth == DirectoryAuth::Integrated && !cfg!(windows) {
+            bail!(
+                "`auth = \"integrated\"` in the [directory] section of {} is only \
+                 available on Windows, where gcm can bind as the signed-in account over \
+                 Kerberos. Use auth = \"simple\" with a bind_dn here.",
+                source_label()
             );
         }
         // A subtree search from an empty base is a search of the whole
@@ -202,7 +290,7 @@ impl Directory {
             bail!(
                 "`base_dn` is not set in the [directory] section of {} — it is what \
                  bounds the search, and an empty one reads the entire forest",
-                path.display()
+                source_label()
             );
         }
         // StartTLS *is* TLS — it is how you get it on port 389. Accepting this
@@ -215,7 +303,7 @@ impl Directory {
                  StartTLS is how TLS is negotiated on the plain port, so this would \
                  connect unencrypted while appearing not to. Set tls = true, or turn \
                  start_tls off as well.",
-                path.display()
+                source_label()
             );
         }
         if !self.base_dn.to_ascii_uppercase().contains("DC=")
@@ -224,7 +312,7 @@ impl Directory {
             bail!(
                 "`base_dn` in the [directory] section of {} does not look like a \
                  distinguished name — it should read like DC=corp,DC=contoso,DC=com",
-                path.display()
+                source_label()
             );
         }
         Ok(())
@@ -302,15 +390,15 @@ impl MariaDb {
 
     fn validate(&self) -> Result<()> {
         if self.host.trim().is_empty() {
-            bail!("`host` is not set in the [mariadb] section of {}", config_path().display());
+            bail!("`host` is not set in the [mariadb] section of {}", source_label());
         }
         if self.user.trim().is_empty() {
-            bail!("`user` is not set in the [mariadb] section of {}", config_path().display());
+            bail!("`user` is not set in the [mariadb] section of {}", source_label());
         }
         if self.database.trim().is_empty() {
             bail!(
                 "`database` is not set in the [mariadb] section of {}",
-                config_path().display()
+                source_label()
             );
         }
         // A prefix is what keeps gcm's tables from colliding with whatever else
@@ -320,7 +408,7 @@ impl MariaDb {
             bail!(
                 "`table_prefix` in the [mariadb] section of {} must not be empty — it is \
                  what stops an export from overwriting a table it did not create",
-                config_path().display()
+                source_label()
             );
         }
         if !self
@@ -472,13 +560,12 @@ impl Config {
         self.query.log_records.clamp(1, 1000)
     }
 
-    fn validate(&self) -> Result<()> {
-        let path = config_path();
+    pub(crate) fn validate(&self) -> Result<()> {
         if is_placeholder(&self.application.client) {
-            bail!("`client` is not set in {}", path.display());
+            bail!("`client` is not set in {}", source_label());
         }
         if is_placeholder(&self.application.tenant) {
-            bail!("`tenant` is not set in {}", path.display());
+            bail!("`tenant` is not set in {}", source_label());
         }
         if let Some(mariadb) = &self.mariadb {
             mariadb.validate()?;
@@ -502,7 +589,10 @@ fn restrict_permissions(path: &Path) {
     let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
 }
 
+/// Nothing to do where there are no Unix modes. Unused on Windows, which seeds
+/// a registry key rather than a file — HKCU is already ACLed to its owner.
 #[cfg(not(unix))]
+#[allow(dead_code, reason = "the file backend it guards is not built on Windows")]
 fn restrict_permissions(_path: &Path) {}
 
 /// True when a value is blank or still carries the shipped placeholder text.
@@ -526,6 +616,26 @@ pub fn config_path() -> PathBuf {
     config_dir().join("config.ini")
 }
 
+/// Where the configuration lives, named the way an error message should name
+/// it: a file path on macOS and Linux, a registry key on Windows.
+///
+/// Every "`host` is not set in …" message routes through here, so the two
+/// storage backends cannot end up telling somebody to edit a file that is not
+/// being read.
+pub fn source_label() -> String {
+    #[cfg(windows)]
+    return crate::registry::key_label();
+    #[cfg(not(windows))]
+    return config_path().display().to_string();
+}
+
+/// The template written on a fresh install. Windows seeds a registry key
+/// instead, so nothing outside the tests reads this there — but the test that
+/// parses it still runs on every platform, and is worth keeping that way.
+#[cfg_attr(
+    windows,
+    allow(dead_code, reason = "the file backend is not built on Windows")
+)]
 const TEMPLATE: &str = r#"; Graphical Cloud Manager (gcm)
 ;
 ; Register a public client application in Entra ID, turn on "Allow public client
@@ -575,9 +685,15 @@ log_records = 500
 ; tenant, which adds the Directory node to the console and fills in the
 ; on-premises half of each synced user's details.
 ;
-; No password here either, for the same reason as above. gcm asks for the bind
-; password when you first open an AD view and keeps it only in memory. A
-; read-only account is sufficient; nothing in this release writes to AD.
+; On Windows gcm binds as the signed-in Windows account by default
+; (auth = "integrated"), so Active Directory evaluates every read and every
+; change against that operator and whatever has been delegated to them. There
+; is no password to store or type. Set auth = "simple" to use bind_dn with a
+; password instead, which is the only option off Windows — gcm then asks for
+; the password once per session and keeps it only in memory.
+;
+; Writes are available once write mode is armed, and are subject to AD's own
+; permissions on top of that.
 ;
 ; tls = true uses LDAPS on port 636. Set start_tls = true instead to negotiate
 ; TLS on port 389 where that is all the domain publishes. Turning tls off puts
@@ -587,7 +703,8 @@ log_records = 500
 ; host = "dc01.corp.contoso.com"
 ; port = 636
 ; base_dn = "DC=corp,DC=contoso,DC=com"
-; bind_dn = "CORP\\svc-gcm"
+; auth = "integrated"
+; bind_dn = "CORP\\svc-gcm"     ; only needed for auth = "simple"
 ; tls = true
 ; start_tls = false
 
@@ -597,11 +714,75 @@ log_records = 500
 ; graph = "https://graph.microsoft.us"
 "#;
 
-/// Load the config, writing a template first if none exists.
+/// Load the config from wherever this platform keeps it.
 ///
-/// The error text names the exact file to edit — this is the first thing anyone
-/// hits on a fresh install, so a bare parse failure would be a poor greeting.
+/// The error text names the exact place to edit — this is the first thing
+/// anyone hits on a fresh install, so a bare parse failure would be a poor
+/// greeting.
 pub fn load() -> Result<Config> {
+    #[cfg(windows)]
+    return load_from_registry();
+    #[cfg(not(windows))]
+    return load_from_file();
+}
+
+/// Read the configuration out of the registry, setting the install up first if
+/// this is the first run on a version that stores it there.
+///
+/// Three cases, in order. A key that already holds a configuration is simply
+/// read. A `config.ini` left by an older version is copied into the registry
+/// and then used, so an upgrade needs no attention. Neither means a fresh
+/// install, which gets placeholders and an explanation.
+#[cfg(windows)]
+fn load_from_registry() -> Result<Config> {
+    if let Some(raw) = crate::registry::read() {
+        let config: Config =
+            parse(&raw).with_context(|| format!("reading {}", source_label()))?;
+        config.validate()?;
+        return Ok(config);
+    }
+
+    let path = config_path();
+    if path.exists() {
+        let raw =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let config: Config =
+            parse(&raw).with_context(|| format!("parsing {}", path.display()))?;
+
+        // Migrated before validation, so an upgrade whose file still holds
+        // placeholders still ends up with the settings in the registry — the
+        // operator is then told to fix them in one place rather than two.
+        crate::registry::migrate(&config).with_context(|| {
+            format!(
+                "copying the configuration from {} into {}",
+                path.display(),
+                source_label()
+            )
+        })?;
+        crate::errorlog::info(
+            "config",
+            &format!(
+                "migrated {} into {} (the file was left in place)",
+                path.display(),
+                source_label()
+            ),
+        );
+
+        config.validate()?;
+        return Ok(config);
+    }
+
+    crate::registry::seed_placeholders()?;
+    bail!(
+        "No configuration found, so one was created at:\n\n    {}\n\n\
+         Fill in `client` and `tenant` under the `application` subkey, then \
+         restart gcm.",
+        source_label()
+    );
+}
+
+#[cfg(not(windows))]
+fn load_from_file() -> Result<Config> {
     let path = config_path();
     if !path.exists() {
         write_template(&path)?;
@@ -612,8 +793,7 @@ pub fn load() -> Result<Config> {
         );
     }
 
-    let raw =
-        fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let raw = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let config: Config = parse(&raw).with_context(|| format!("parsing {}", path.display()))?;
     config.validate()?;
     Ok(config)
@@ -625,7 +805,7 @@ pub fn load() -> Result<Config> {
 /// people reach for in a file named `.ini` — and rejecting it produces a
 /// baffling "key with no value" error. Normalise whole-line `;` comments first
 /// so both conventions work.
-fn parse(raw: &str) -> Result<Config, toml::de::Error> {
+pub(crate) fn parse(raw: &str) -> Result<Config, toml::de::Error> {
     toml::from_str(&normalise_comments(raw))
 }
 
@@ -647,6 +827,9 @@ fn normalise_comments(raw: &str) -> String {
         .join("\n")
 }
 
+/// Only ever called where the configuration is a file. Windows seeds a
+/// registry key instead — see [`crate::registry::seed_placeholders`].
+#[cfg(not(windows))]
 fn write_template(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -669,6 +852,7 @@ mod tests {
             port: 636,
             base_dn: "DC=corp,DC=contoso,DC=com".into(),
             bind_dn: "CORP\\svc-gcm".into(),
+            auth: DirectoryAuth::Simple,
             tls,
             start_tls,
         }
@@ -689,6 +873,74 @@ mod tests {
         directory(true, false).validate().expect("LDAPS");
         directory(true, true).validate().expect("StartTLS");
         directory(false, false).validate().expect("deliberately plaintext");
+    }
+
+    #[test]
+    fn integrated_auth_needs_no_bind_dn_but_a_simple_bind_does() {
+        let mut settings = directory(true, false);
+        settings.bind_dn = String::new();
+        assert!(
+            settings.validate().is_err(),
+            "a simple bind with no bind_dn cannot authenticate as anybody"
+        );
+
+        settings.auth = DirectoryAuth::Integrated;
+        let result = settings.validate();
+        if cfg!(windows) {
+            // Nothing to name: the identity is whoever is signed in.
+            result.expect("integrated authentication supplies its own identity");
+        } else {
+            // And off Windows it is refused rather than quietly downgraded to
+            // a simple bind, which would run as a different account than the
+            // configuration asked for.
+            let message = format!("{:#}", result.expect_err("integrated is Windows-only"));
+            assert!(message.contains("Windows"), "got: {message}");
+            assert!(message.contains("simple"), "got: {message}");
+        }
+    }
+
+    #[test]
+    fn the_default_bind_method_follows_the_platform() {
+        // A Windows install that never edits its configuration should get
+        // per-operator permissions, because that is the behaviour worth having
+        // by default; everywhere else integrated is not available at all.
+        let raw = r#"
+[application]
+client = "abc"
+tenant = "def"
+
+[directory]
+host = "dc01.corp.contoso.com"
+base_dn = "DC=corp,DC=contoso,DC=com"
+bind_dn = "CORP\\svc-gcm"
+"#;
+        let config: Config = parse(raw).expect("should parse");
+        let directory = config.directory.expect("[directory] was given");
+        if cfg!(windows) {
+            assert_eq!(directory.auth, DirectoryAuth::Integrated);
+            assert!(directory.uses_integrated_auth());
+        } else {
+            assert_eq!(directory.auth, DirectoryAuth::Simple);
+            assert!(!directory.uses_integrated_auth());
+        }
+    }
+
+    #[test]
+    fn the_bind_method_is_spelled_the_way_the_documentation_spells_it() {
+        // Lowercase, matching every other value in the file. A mismatch here
+        // would only show up as a parse error on somebody's first attempt.
+        for (text, expected) in [
+            ("simple", DirectoryAuth::Simple),
+            ("integrated", DirectoryAuth::Integrated),
+        ] {
+            let raw = format!(
+                "[application]\nclient = \"a\"\ntenant = \"b\"\n\n\
+                 [directory]\nhost = \"dc01\"\nbase_dn = \"DC=corp\"\n\
+                 bind_dn = \"x\"\nauth = \"{text}\"\n"
+            );
+            let config: Config = parse(&raw).unwrap_or_else(|err| panic!("{text}: {err}"));
+            assert_eq!(config.directory.unwrap().auth, expected);
+        }
     }
 
     #[test]

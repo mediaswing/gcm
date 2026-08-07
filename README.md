@@ -152,13 +152,14 @@ In the Entra admin centre, under **App registrations → New registration**:
 
 ## Configuration
 
-Run gcm once. It writes a commented template and tells you where:
+Run gcm once. It writes a commented template — or, on Windows, a registry key —
+and tells you where:
 
-| Platform | Path |
+| Platform | Where |
 | --- | --- |
 | macOS | `~/Library/Application Support/gcm/config.ini` |
 | Linux | `~/.config/gcm/config.ini` |
-| Windows | `%APPDATA%\gcm\config.ini` |
+| Windows | `HKEY_CURRENT_USER\Software\gcm` |
 
 Fill in the two IDs and restart:
 
@@ -191,9 +192,46 @@ The file is INI-shaped and parsed as TOML, so both `;` and `#` introduce a
 comment. `config.ini.example` in this repo is a placeholder copy, safe to
 commit.
 
+### On Windows: the registry
+
+Windows keeps the same settings in the registry rather than in a file, because
+a registry key can be deployed by Group Policy and a file in a user profile
+cannot. Each section above becomes a subkey, and each setting a value:
+
+```
+HKEY_CURRENT_USER\Software\gcm
+    application\    client       REG_SZ     9f4a1c7e-1234-5678-9abc-def012345678
+                    tenant       REG_SZ     contoso.onmicrosoft.com
+    query\          page_size    REG_DWORD  999
+                    max_objects  REG_DWORD  0
+    directory\      host         REG_SZ     dc01.corp.contoso.com
+                    port         REG_DWORD  636
+                    base_dn      REG_SZ     DC=corp,DC=contoso,DC=com
+                    bind_dn      REG_SZ     CORP\svc-gcm
+                    tls          REG_DWORD  1
+```
+
+Notes:
+
+- **`HKEY_LOCAL_MACHINE\Software\gcm` is read as a fallback**, value by value.
+  Set the tenant and client ID machine-wide by policy, and a user can still
+  override an individual setting without the policy knowing.
+- Numbers and flags are `REG_DWORD` by convention, but `REG_SZ` is accepted for
+  both — `"999"`, and `"true"`/`"false"` — so a policy template or a hand edit
+  does not have to get the type right.
+- **Omit `mariadb` and `directory` entirely** unless you use them. The presence
+  of the subkey is what turns the feature on, so an empty one fails validation
+  rather than leaving it off.
+- **Upgrading from a version that used `config.ini`** needs nothing: the file is
+  copied into the registry on first run, and then left where it is.
+- A registry key cannot be pasted into a support ticket, so **Copy the
+  configuration** (on the failure screen) renders it back as INI text. It
+  contains no passwords, the same as the file.
+
 ### Where the config lives, and why
 
-Configuration is read from your user directory, never from beside the binary.
+Configuration is read from your user directory or the registry, never from
+beside the binary.
 
 Neither value in it is a secret. A public client's ID travels in plaintext on
 every authorization request, and the tenant ID is discoverable by anyone from
@@ -207,6 +245,11 @@ That token is a bearer credential for your whole read surface until it expires
 or is revoked. Both files live in one owner-controlled directory so there is
 exactly one place to protect. `.gitignore` covers `config.ini` and `token.json`
 in case a working copy ever lands in the tree.
+
+Moving the settings into the registry on Windows changes none of that. The
+token cache stays a file, and so do both logs — `error.log` and `actions.log`
+are an append-only diagnostic and an audit trail, which is not what the registry
+is for, and "send me the gcm folder" has to go on working.
 
 **Sign out** in the toolbar forgets the identity completely: the cached refresh
 token on disk, the tokens held in memory, and — via `prompt=select_account` on
@@ -605,14 +648,70 @@ The join is on `sAMAccountName`, matched case-insensitively against the tenant's
 `onPremisesSamAccountName`. It is the one identifier both directories agree on,
 and the only one that survives a UPN change or a mail-domain move.
 
+### How gcm binds, and why it matters
+
+| `auth` | What happens | Where |
+| --- | --- | --- |
+| `integrated` | Binds as the **signed-in Windows account** over Kerberos (SSPI) | Windows only, and the default there |
+| `simple` | Binds as `bind_dn` with a password typed once per session | Everywhere |
+
+This is the setting that decides *whose* permissions apply. Under
+`integrated`, the domain controller evaluates every read and every change
+against the operator's own account — so somebody delegated password resets over
+one OU can reset passwords in that OU and nothing else, and gcm does not have to
+know anything about that arrangement. There is no password to store or type, and
+`bind_dn` is not needed.
+
+Under `simple`, everything carries the service account's rights instead, and the
+console cannot tell one operator from another.
+
+Two things to get right for `integrated`:
+
+- **`host` must be the DC's real FQDN.** Kerberos builds its service principal
+  from that name, so an IP address or a CNAME is refused even though it resolves.
+- **The machine must be domain-joined** and the operator signed in with a domain
+  account.
+
+### Changing things
+
+Writes need **write mode** armed (`Ctrl+Shift+W`), exactly as tenant changes do,
+and they go through the same confirmation and the same `actions.log` — entries
+are tagged `"system": "active-directory"` so on-premises changes can be found on
+their own.
+
+What is offered, on a selected account or computer:
+
+- Enable or disable
+- Unlock (an account locked out by failed sign-ins)
+- Reset password, optionally requiring a change at next sign-in
+- Edit attributes — display name, description, title, department, company,
+  office, telephone, mobile, email, employee ID
+- Delete
+
+Two gates apply rather than one. gcm's write mode is the first; **Active
+Directory's own access check is the second**, and under `integrated` that one is
+evaluated against the operator. A refusal comes back as "does not have
+permission on the object" and is AD's decision, not gcm's — the fix is a
+delegation, not anything in the console. Entries are offered even where the
+operator may turn out not to be delegated, because the console cannot know
+without asking the DC, and guessing in the direction of "you cannot do this"
+would be worse.
+
+A password reset is refused outright when `tls` is off. Active Directory refuses
+it too, but only after the password has crossed the network in the clear.
+
 ### Things it will not do
 
 - **No SRV discovery.** `host` names a domain controller explicitly. Finding one
   via `_ldap._tcp.dc._msdcs` would mean shipping a DNS resolver, and naming the
   DC is also the only way to pin reads to a particular replica.
-- **Simple bind only.** No Kerberos or NTLM, so the bind password is sent in the
-  bind request — which is why `tls` defaults to on and the dialog says so in red
-  when it is not.
+- **No group membership editing, and no moving between OUs.** Both need
+  somewhere to pick the target from, and gcm reads only users and computers from
+  a DC — there is no AD group collection and no OU tree to choose from.
+- **No object creation.** Creating an AD user means choosing an OU, an RDN, a
+  `sAMAccountName` and a UPN suffix, and getting any of them wrong leaves an
+  object to clean up by hand. gcm creates users in the tenant, where those
+  decisions are far smaller.
 - **`lastLogonTimestamp`, not `lastLogon`.** It replicates on a delay of up to
   14 days by design. Both the table and the details pane say so, because that is
   precisely the window people use it to judge.
@@ -725,6 +824,31 @@ that pane does not have focus, so `F6` is never disorienting. The focused pane
 carries a blue ring. While the filter box has focus, only `Esc` and the pane
 keys are intercepted — everything else is typing. Rows are announced to
 assistive technology as whole records rather than as loose cells.
+
+## Updating
+
+gcm checks GitHub for a newer release at startup and offers one if it finds it,
+showing that version's changelog entry in the dialog. The check is best-effort:
+if GitHub cannot be reached, nothing is said about it.
+
+**Update now** downloads the release for your platform and replaces the install
+in place, on both Windows and macOS. gcm cannot overwrite itself while running,
+so in both cases the work is handed to a small detached helper that waits for
+gcm to exit, swaps the build, and relaunches it.
+
+- **Windows** — the new files are copied over the install directory.
+- **macOS** — the new `.app` is staged beside the old one and moved into place
+  with two renames, so a failure part-way leaves you with a working application
+  either way. Because gcm downloads the update itself rather than a browser
+  doing it, the replacement is not quarantined and opens without the
+  right-click → **Open** that the first install needed.
+
+Nothing in your configuration is touched: it lives in your user directory (or
+the registry on Windows), not beside the binary.
+
+Where gcm is not running from an installed application — a `cargo run` build,
+or a loose binary — there is no install to replace, so the dialog offers the
+release page instead.
 
 ## Running
 

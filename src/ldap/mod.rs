@@ -1,4 +1,4 @@
-//! A read-only LDAP client for on-premises Active Directory.
+//! An LDAP client for on-premises Active Directory.
 //!
 //! The shape mirrors [`crate::graph`] deliberately, because the console upstream
 //! of both cannot tell them apart: paged reads of whole collections, a ceiling
@@ -8,28 +8,39 @@
 //!
 //! Three things differ enough from the Graph client to be worth stating.
 //!
-//! * **Nothing here is long-lived.** A connection is opened, bound, searched
-//!   and dropped inside one call. That is not an optimisation — it is what lets
-//!   the bind password travel with the request and be forgotten afterwards,
+//! * **Nothing here is long-lived.** A connection is opened, bound, used and
+//!   dropped inside one call. That is not an optimisation — it is what lets a
+//!   bind password travel with the request and be forgotten afterwards,
 //!   instead of the worker holding a credential for the life of the process.
 //! * **Paging is a control, not a link.** AD's simple paged-results control
 //!   carries an opaque cookie in the same place `@odata.nextLink` would carry a
 //!   URL. `ldap3`'s [`PagedResults`] adapter hides the difference.
-//! * **Everything is read-only.** No `Mod`, no `add`, no `delete`. The write
-//!   gate in [`crate::worker`] governs the tenant; this module gives it nothing
-//!   to govern.
+//! * **Who gcm binds as is a configuration decision with real consequences.**
+//!   Under `auth = "integrated"` on Windows the bind uses the operator's own
+//!   Kerberos ticket, so every read and every write is evaluated by the DC
+//!   against *their* account and whatever has been delegated to it. Under a
+//!   simple bind everything carries the service account's rights instead, and
+//!   the console cannot tell one operator from another.
+//!
+//! Writes live in [`actions`], behind the same write gate in
+//! [`crate::worker`] that governs the tenant — and behind Active Directory's
+//! own access check, which is the one that actually distinguishes between
+//! operators.
 
+pub mod actions;
 pub mod models;
 
+use std::collections::HashSet;
 use std::sync::Once;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use ldap3::adapters::{Adapter, EntriesOnly, PagedResults};
-use ldap3::{Ldap, LdapConnAsync, LdapConnSettings, LdapError, Scope, SearchEntry};
+use ldap3::{Ldap, LdapConnAsync, LdapConnSettings, LdapError, Mod, Scope, SearchEntry};
 
 use crate::config::Directory;
 use crate::mariadb::Secret;
+use actions::DirectoryAction;
 use models::{AdComputer, AdUser, Attributes};
 
 /// How long to wait for a DC to answer before giving up.
@@ -52,6 +63,16 @@ const RC_REFERRAL: u32 = 10;
 const RC_SIZE_LIMIT: u32 = 4;
 /// LDAP result code 11: the DC's own administrative limit stopped it early.
 const RC_ADMIN_LIMIT: u32 = 11;
+/// LDAP result code 50: the bound account may not change this object. Under
+/// integrated authentication this is the operator's own delegation talking.
+const RC_INSUFFICIENT_ACCESS: u32 = 50;
+/// LDAP result code 53: AD declines the operation — a password that fails
+/// policy, or an attribute that cannot be written this way.
+const RC_UNWILLING_TO_PERFORM: u32 = 53;
+/// LDAP result code 19: the value breaks a constraint on the attribute.
+const RC_CONSTRAINT_VIOLATION: u32 = 19;
+/// LDAP result code 68: an object of that name is already there.
+const RC_ALREADY_EXISTS: u32 = 68;
 
 /// Install a rustls crypto provider, once per process.
 ///
@@ -80,11 +101,52 @@ fn ensure_crypto_provider() {
 fn explain(settings: &Directory, error: LdapError) -> anyhow::Error {
     match &error {
         LdapError::LdapResult { result } => match result.rc {
+            // Under integrated authentication there is no password to have got
+            // wrong, so the advice has to be different: rc=49 there means the
+            // ticket was refused, and the usual cause is that `host` is not the
+            // name the DC holds a service principal for.
+            RC_INVALID_CREDENTIALS if settings.uses_integrated_auth() => anyhow!(
+                "{} refused the signed-in Windows account. Check that this machine is \
+                 joined to the domain, that you are logged in with a domain account, \
+                 and that `host` is the domain controller's real FQDN — Kerberos builds \
+                 its service principal from that name, so an IP address or a CNAME is \
+                 refused here even though it would resolve.",
+                settings.host
+            ),
             RC_INVALID_CREDENTIALS => anyhow!(
                 "{} rejected the credentials for {}. Check bind_dn and the password — \
                  AD reports a wrong password and an unknown account identically.",
                 settings.host,
                 settings.bind_dn
+            ),
+            // The one that matters once writes exist. This is AD's own access
+            // check refusing, not gcm's write gate — so the fix is a
+            // delegation on the object, not anything in the console.
+            RC_INSUFFICIENT_ACCESS => anyhow!(
+                "{} refused that change: {} does not have permission on the object. \
+                 This is Active Directory's own access check, not gcm's — the account \
+                 needs the right delegated on that object or the OU containing it.",
+                settings.host,
+                settings.describe()
+            ),
+            // AD refuses a password write on an unencrypted connection, and
+            // also refuses one that does not meet the domain's complexity or
+            // history policy, with the same code.
+            RC_UNWILLING_TO_PERFORM => anyhow!(
+                "{} was unwilling to perform that change. For a password reset this \
+                 usually means the new password does not meet the domain's complexity, \
+                 length or history policy; for other changes, that the attribute cannot \
+                 be set this way.",
+                settings.host
+            ),
+            RC_CONSTRAINT_VIOLATION => anyhow!(
+                "{} rejected the value as violating a constraint on that attribute — \
+                 for a password, the domain's minimum age or history policy.",
+                settings.host
+            ),
+            RC_ALREADY_EXISTS => anyhow!(
+                "{} already has an object with that name in the target location.",
+                settings.host
             ),
             RC_NO_SUCH_OBJECT => anyhow!(
                 "{} has no object at {}. Check base_dn in the [directory] section.",
@@ -142,6 +204,53 @@ fn explain(settings: &Directory, error: LdapError) -> anyhow::Error {
     }
 }
 
+/// Authenticate an open connection, by whichever method the configuration asks
+/// for.
+///
+/// The integrated path is what makes a Directory view show the operator their
+/// own permissions rather than a service account's: SSPI binds with the
+/// Kerberos ticket Windows already issued them at logon, so the DC evaluates
+/// every read and every write against their account and its delegations.
+async fn bind(ldap: &mut Ldap, settings: &Directory, password: Option<&Secret>) -> Result<()> {
+    if settings.uses_integrated_auth() {
+        #[cfg(windows)]
+        {
+            // The SPN is built from this name, so it has to be the DC's real
+            // FQDN — an IP address or a CNAME produces a ticket request for a
+            // principal the KDC has never heard of. `explain` says so.
+            ldap.sasl_gssapi_bind(&settings.host)
+                .await
+                .map_err(|err| explain(settings, err))?
+                .success()
+                .map_err(|err| explain(settings, err))?;
+            return Ok(());
+        }
+        // Unreachable in practice: `Directory::validate` refuses integrated
+        // authentication off Windows rather than letting it get this far.
+        // Kept so the branch is a stated refusal rather than a silent
+        // downgrade to a simple bind with an empty DN.
+        #[cfg(not(windows))]
+        return Err(anyhow!(
+            "integrated authentication is only available on Windows"
+        ));
+    }
+
+    let password = password.ok_or_else(|| {
+        anyhow!(
+            "no bind password was supplied for {}, and this connection is not using \
+             integrated authentication",
+            settings.host
+        )
+    })?;
+
+    ldap.simple_bind(&settings.bind_dn, password.expose())
+        .await
+        .map_err(|err| explain(settings, err))?
+        .success()
+        .map_err(|err| explain(settings, err))?;
+    Ok(())
+}
+
 /// An open, bound connection to a domain controller.
 ///
 /// Holds no credential: the password is consumed by [`Self::connect`] and the
@@ -153,7 +262,10 @@ struct Connection {
 
 impl Connection {
     /// Open a connection and bind.
-    async fn connect(settings: &Directory, password: &Secret) -> Result<Self> {
+    ///
+    /// `password` is `None` under integrated authentication, where there is no
+    /// credential to carry: SSPI uses the ticket the operator already has.
+    async fn connect(settings: &Directory, password: Option<&Secret>) -> Result<Self> {
         ensure_crypto_provider();
 
         let conn_settings = LdapConnSettings::new()
@@ -169,11 +281,7 @@ impl Connection {
         // progress; without this every await below hangs rather than failing.
         ldap3::drive!(conn);
 
-        ldap.simple_bind(&settings.bind_dn, password.expose())
-            .await
-            .map_err(|err| explain(settings, err))?
-            .success()
-            .map_err(|err| explain(settings, err))?;
+        bind(&mut ldap, settings, password).await?;
 
         Ok(Self {
             ldap,
@@ -258,9 +366,172 @@ impl Connection {
         Ok(results)
     }
 
+    /// Read one integer attribute from a single object.
+    ///
+    /// A base-scope search rather than a subtree one: the DN is already known
+    /// exactly, and searching beneath it would be both slower and wrong.
+    async fn read_u32(&mut self, dn: &str, attribute: &str) -> Result<Option<u32>> {
+        let (entries, outcome) = self
+            .ldap
+            .search(dn, Scope::Base, "(objectClass=*)", vec![attribute])
+            .await
+            .map_err(|err| explain(&self.settings, err))?
+            .success()
+            .map_err(|err| explain(&self.settings, err))?;
+        let _ = outcome;
+
+        let Some(entry) = entries.into_iter().next() else {
+            return Ok(None);
+        };
+        let entry = SearchEntry::construct(entry);
+        Ok(entry
+            .attrs
+            .get(attribute)
+            .and_then(|values| values.first())
+            .and_then(|value| value.parse().ok()))
+    }
+
+    /// Apply one modification, translating the result code on the way back.
+    async fn modify(&mut self, dn: &str, mods: Vec<Mod<Vec<u8>>>) -> Result<()> {
+        self.ldap
+            .modify(dn, mods)
+            .await
+            .map_err(|err| explain(&self.settings, err))?
+            .success()
+            .map_err(|err| explain(&self.settings, err))?;
+        Ok(())
+    }
+
+    /// Carry out one change.
+    async fn apply(&mut self, action: &DirectoryAction) -> Result<()> {
+        match action {
+            DirectoryAction::SetEnabled { dn, enabled, .. } => {
+                // Read-modify-write, because userAccountControl is a bitfield
+                // holding a dozen unrelated flags. Writing a bare 0x2 would
+                // clear NORMAL_ACCOUNT along with everything else and leave an
+                // account that fails to authenticate for reasons that take a
+                // long afternoon to find.
+                let current = self
+                    .read_u32(dn, "userAccountControl")
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!("{dn} has no userAccountControl, so it is not an account")
+                    })?;
+                let updated = actions::account_control_for(current, *enabled);
+                if updated == current {
+                    // Already in the requested state. Writing it anyway would
+                    // succeed and log a change that did not happen.
+                    return Ok(());
+                }
+                self.modify(dn, vec![replace("userAccountControl", updated.to_string())])
+                    .await
+            }
+            DirectoryAction::Unlock { dn, .. } => {
+                // 0 is what AD defines as "not locked out". The attribute is
+                // never removed; a missing lockoutTime is not the same thing.
+                self.modify(dn, vec![replace("lockoutTime", "0")]).await
+            }
+            DirectoryAction::ResetPassword {
+                dn,
+                password,
+                must_change,
+                ..
+            } => {
+                let mut mods = vec![Mod::Replace(
+                    b"unicodePwd".to_vec(),
+                    HashSet::from([actions::encode_password(password.expose())]),
+                )];
+                if *must_change {
+                    // 0 means "must change at next logon". -1 would mean "set
+                    // it now"; anything else is refused.
+                    mods.push(replace("pwdLastSet", "0"));
+                }
+                self.modify(dn, mods).await
+            }
+            DirectoryAction::UpdateUser { dn, patch, .. } => {
+                let mods = patch.modifications();
+                if mods.is_empty() {
+                    return Ok(());
+                }
+                self.modify(dn, mods).await
+            }
+            DirectoryAction::Delete { dn, .. } => {
+                self.ldap
+                    .delete(dn)
+                    .await
+                    .map_err(|err| explain(&self.settings, err))?
+                    .success()
+                    .map_err(|err| explain(&self.settings, err))?;
+                Ok(())
+            }
+        }
+    }
+
     async fn unbind(mut self) {
         let _ = self.ldap.unbind().await;
     }
+}
+
+/// A `Replace` of one textual attribute with one value.
+fn replace(attribute: &str, value: impl AsRef<str>) -> Mod<Vec<u8>> {
+    Mod::Replace(
+        attribute.as_bytes().to_vec(),
+        HashSet::from([value.as_ref().as_bytes().to_vec()]),
+    )
+}
+
+/// Who the domain controller will evaluate a change against.
+///
+/// Under a simple bind this is the configured service account, and every
+/// operator's changes look identical. Under integrated authentication it is
+/// the signed-in Windows account — which is the whole reason that mode exists,
+/// and so is the name the audit log has to carry. `USERDOMAIN` and `USERNAME`
+/// are what Windows itself sets for the interactive session, and they produce
+/// exactly the `DOMAIN\user` form an administrator will search AD's own logs
+/// for.
+pub fn acting_identity(settings: &Directory) -> String {
+    if !settings.uses_integrated_auth() {
+        return settings.bind_dn.clone();
+    }
+
+    match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+        (Ok(domain), Ok(user)) if !domain.is_empty() && !user.is_empty() => {
+            format!("{domain}\\{user}")
+        }
+        (_, Ok(user)) if !user.is_empty() => user,
+        // Better to say the identity is unknown than to name the wrong one.
+        _ => "the signed-in Windows account".into(),
+    }
+}
+
+/// Carry out one change against the domain controller.
+///
+/// The write gate in [`crate::worker`] decides whether this is called at all.
+/// What happens once it is called is Active Directory's decision: under
+/// integrated authentication the connection carries the operator's own
+/// identity, so their delegations are what determine whether the DC accepts
+/// it.
+pub async fn apply(
+    settings: &Directory,
+    password: Option<&Secret>,
+    action: &DirectoryAction,
+) -> Result<()> {
+    // Refused here rather than by the DC. AD rejects `unicodePwd` on an
+    // unencrypted connection — but only after the password has already
+    // travelled over it, which is precisely the thing worth preventing.
+    if action.carries_a_password() && !settings.tls {
+        return Err(anyhow!(
+            "refusing to set a password over an unencrypted connection to {}. Set \
+             tls = true (LDAPS on port 636) or start_tls = true in the [directory] \
+             section; Active Directory will not accept a password reset any other way.",
+            settings.host
+        ));
+    }
+
+    let mut connection = Connection::connect(settings, password).await?;
+    let outcome = connection.apply(action).await;
+    connection.unbind().await;
+    outcome
 }
 
 /// Read every user account under the configured base DN.
@@ -271,7 +542,7 @@ impl Connection {
 /// depending on which one answered.
 pub async fn users(
     settings: &Directory,
-    password: &Secret,
+    password: Option<&Secret>,
     page_size: i32,
     max_objects: u32,
 ) -> Result<Vec<AdUser>> {
@@ -295,7 +566,7 @@ pub async fn users(
 /// Read every computer account under the configured base DN.
 pub async fn computers(
     settings: &Directory,
-    password: &Secret,
+    password: Option<&Secret>,
     page_size: i32,
     max_objects: u32,
 ) -> Result<Vec<AdComputer>> {
@@ -321,7 +592,7 @@ pub async fn computers(
 /// The bind dialog calls this before the password is accepted for the session,
 /// so a typo is reported against the field that caused it rather than surfacing
 /// later as an empty Users view.
-pub async fn verify(settings: &Directory, password: &Secret) -> Result<()> {
+pub async fn verify(settings: &Directory, password: Option<&Secret>) -> Result<()> {
     let connection = Connection::connect(settings, password).await?;
     connection.unbind().await;
     Ok(())
@@ -338,6 +609,7 @@ mod tests {
             port: 636,
             base_dn: "DC=corp,DC=contoso,DC=com".into(),
             bind_dn: "CORP\\svc-gcm".into(),
+            auth: crate::config::DirectoryAuth::Simple,
             tls: true,
             start_tls: false,
         }
@@ -353,6 +625,50 @@ mod tests {
                 ctrls: Vec::new(),
             },
         }
+    }
+
+    fn integrated() -> Directory {
+        Directory {
+            auth: crate::config::DirectoryAuth::Integrated,
+            bind_dn: String::new(),
+            ..settings()
+        }
+    }
+
+    #[test]
+    fn a_refused_ticket_does_not_advise_checking_a_password() {
+        // Under integrated authentication there is no password and no
+        // bind_dn, so the simple-bind advice would send somebody looking for
+        // settings that are deliberately empty. The real causes are a
+        // non-domain-joined machine or a host that is not the DC's FQDN.
+        let message = format!("{:#}", explain(&integrated(), result(RC_INVALID_CREDENTIALS)));
+        assert!(!message.contains("bind_dn"), "got: {message}");
+        assert!(!message.contains("password"), "got: {message}");
+        assert!(message.contains("FQDN"), "got: {message}");
+        assert!(message.contains("domain"), "got: {message}");
+    }
+
+    #[test]
+    fn a_permission_failure_is_blamed_on_ad_rather_than_on_gcm() {
+        // rc=50 is the whole point of integrated authentication: the operator
+        // is being refused by Active Directory's own access check, and no
+        // amount of arming write mode in gcm will change that. The message has
+        // to say so, or the next thing they do is look in the wrong place.
+        let message = format!("{:#}", explain(&integrated(), result(RC_INSUFFICIENT_ACCESS)));
+        assert!(message.contains("Active Directory's own"), "got: {message}");
+        assert!(message.contains("delegated"), "got: {message}");
+        // And it names who was refused, which under integrated auth is the
+        // signed-in account rather than a bind DN.
+        assert!(message.contains("signed-in Windows account"), "got: {message}");
+    }
+
+    #[test]
+    fn a_simple_bind_still_gets_the_simple_bind_advice() {
+        // The two messages must not converge: a service-account setup has a
+        // bind_dn and a password that genuinely might be wrong.
+        let message = format!("{:#}", explain(&settings(), result(RC_INVALID_CREDENTIALS)));
+        assert!(message.contains("bind_dn"), "got: {message}");
+        assert!(message.contains("password"), "got: {message}");
     }
 
     #[test]
@@ -393,8 +709,11 @@ mod tests {
 
     #[test]
     fn an_unrecognised_code_is_still_reported_with_its_number() {
-        let message = format!("{:#}", explain(&settings(), result(53)));
-        assert!(message.contains("53"), "got: {message}");
+        // 51 (busy) is deliberately one gcm does not translate. Codes that
+        // have their own message — 49, 50, 53 and the rest above — are tested
+        // for that message instead.
+        let message = format!("{:#}", explain(&settings(), result(51)));
+        assert!(message.contains("51"), "got: {message}");
     }
 
     #[test]
@@ -414,6 +733,52 @@ mod tests {
         config.start_tls = false;
         assert_eq!(config.url(), "ldap://dc01.corp.contoso.com:389");
         assert_eq!(config.transport(), "unencrypted");
+    }
+
+    #[test]
+    fn a_password_reset_is_refused_before_it_reaches_an_unencrypted_wire() {
+        // The ordering is the whole point. Active Directory also refuses this,
+        // but only after the password has already crossed the network in the
+        // clear — so gcm has to refuse first. The host here is unroutable, and
+        // the test passing quickly is itself evidence that nothing was
+        // connected to.
+        let mut plaintext = settings();
+        plaintext.tls = false;
+        plaintext.start_tls = false;
+        plaintext.port = 389;
+
+        let reset = DirectoryAction::ResetPassword {
+            dn: "CN=Jane Smith,OU=Staff,DC=corp,DC=contoso,DC=com".into(),
+            name: "Jane Smith".into(),
+            password: Secret::new("Pa55w0rd!".into()),
+            must_change: true,
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let err = runtime
+            .block_on(apply(&plaintext, Some(&Secret::new("x".into())), &reset))
+            .expect_err("a password must not be sent unencrypted");
+
+        let message = format!("{err:#}");
+        assert!(message.contains("unencrypted"), "got: {message}");
+        assert!(message.contains("tls = true"), "got: {message}");
+        // And the password itself is never in the message.
+        assert!(!message.contains("Pa55w0rd"), "got: {message}");
+    }
+
+    #[test]
+    fn changes_that_carry_no_password_are_not_blocked_by_the_tls_check() {
+        // The guard is specific to `unicodePwd`; an unlock over a plaintext
+        // connection is a bad idea but not this function's decision to refuse,
+        // and blocking it here would be a surprise.
+        let unlock = DirectoryAction::Unlock {
+            dn: "CN=a,DC=b".into(),
+            name: "a".into(),
+        };
+        assert!(!unlock.carries_a_password());
     }
 
     #[test]

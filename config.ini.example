@@ -1,13 +1,19 @@
 ; Graphical Cloud Manager (gcm) — example configuration
 ;
+; On Windows these settings live in the registry instead, under
+; HKEY_CURRENT_USER\Software\gcm — one subkey per section below, one value per
+; setting. This file is still the reference for what each of them means, and an
+; existing config.ini is copied into the registry automatically on first run.
+; See the README for the key layout.
+;
 ; This file is an EXAMPLE ONLY and is safe to commit. The real configuration is
 ; read from your user directory, never from alongside the binary:
 ;
 ;   macOS    ~/Library/Application Support/gcm/config.ini
 ;   Linux    ~/.config/gcm/config.ini
-;   Windows  %APPDATA%\gcm\config.ini
+;   Windows  HKEY_CURRENT_USER\Software\gcm  (the registry, not a file)
 ;
-; Run gcm once and it will write a template there for you to fill in.
+; Run gcm once and it will create one there for you to fill in.
 ;
 ; Neither value below is a secret: the tenant ID is publicly discoverable from
 ; any verified domain, and a public client's ID is sent in plaintext on every
@@ -30,13 +36,20 @@ max_objects = 0
 ; the Directory node to the console, and fills in the on-premises half of each
 ; synced user's details.
 ;
-; No password here: gcm asks for the bind password when you first open an AD
-; view and keeps it in memory only. A read-only account is enough.
+; No password here. On Windows gcm binds as the signed-in Windows account
+; (auth = "integrated"), so AD evaluates every read and every change against
+; that operator's own delegations and there is nothing to type. Elsewhere, and
+; with auth = "simple", it asks for the bind password once per session and
+; keeps it in memory only.
+;
+; Changes to AD need write mode armed in the console, and are still subject to
+; the bound account's permissions in Active Directory itself.
 ; [directory]
 ; host = "dc01.corp.contoso.com"
 ; port = 636
 ; base_dn = "DC=corp,DC=contoso,DC=com"
-; bind_dn = "CORP\\svc-gcm"
+; auth = "integrated"          ; Windows default; "simple" uses bind_dn below
+; bind_dn = "CORP\\svc-gcm"     ; only needed for auth = "simple"
 ; tls = true
 ; start_tls = false
 

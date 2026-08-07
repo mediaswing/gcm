@@ -49,8 +49,12 @@ pub fn show(ctx: &egui::Context, release: &Release) -> Outcome {
             RichText::new(if release.can_self_update {
                 "gcm will download the update, close, and reopen on the new version."
             } else {
-                "gcm cannot update itself on this platform — this opens the release page \
-                 so you can install it the way you did the first time."
+                // Reached when gcm is not running from an installed
+                // application — a loose binary, or a build run from a source
+                // tree. There is no install to replace, so the honest offer is
+                // the release page.
+                "gcm cannot replace this install on its own — this opens the release page \
+                 so you can update it the way you installed it."
             })
             .small()
             .color(theme::MUTED),

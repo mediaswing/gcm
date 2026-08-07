@@ -121,12 +121,28 @@ pub enum Command {
     /// and the UI decides how long it lives.
     LoadDirectory {
         collection: Collection,
-        password: crate::mariadb::Secret,
+        /// `None` under integrated authentication, where there is no
+        /// credential to carry: the bind uses the operator's own Kerberos
+        /// ticket and the DC evaluates the read against their account.
+        password: Option<crate::mariadb::Secret>,
     },
     /// Check a bind DN and password against the domain controller without
     /// reading anything, so a typo is reported by the dialog that caused it.
     VerifyDirectoryBind {
-        password: crate::mariadb::Secret,
+        password: Option<crate::mariadb::Secret>,
+    },
+    /// Change something in the on-premises domain.
+    ///
+    /// Separate from [`Command::Execute`] because it goes somewhere else
+    /// entirely — a domain controller rather than Graph — but it passes the
+    /// same write gate and lands in the same audit log, which is the property
+    /// worth preserving. `refresh` names the view to re-read afterwards; the
+    /// action itself cannot say, because a DN alone does not reveal whether it
+    /// is a user or a computer.
+    DirectoryAction {
+        action: Box<crate::ldap::actions::DirectoryAction>,
+        password: Option<crate::mariadb::Secret>,
+        refresh: Collection,
     },
     /// Ask GitHub for a newer release. Sent once, at startup.
     CheckForUpdate,
@@ -518,14 +534,31 @@ async fn run<F: Fn() + Send + 'static>(
                     directory.as_ref(),
                     &reporter,
                     collection,
-                    &password,
+                    password.as_ref(),
                     ldap_page_size,
                     ldap_max_objects,
                 )
                 .await;
             }
             Command::VerifyDirectoryBind { password } => {
-                verify_directory_bind(directory.as_ref(), &reporter, &password).await;
+                verify_directory_bind(directory.as_ref(), &reporter, password.as_ref()).await;
+            }
+            Command::DirectoryAction {
+                action,
+                password,
+                refresh,
+            } => {
+                execute_directory(
+                    directory.as_ref(),
+                    &reporter,
+                    write_armed,
+                    &action,
+                    password.as_ref(),
+                    refresh,
+                    ldap_page_size,
+                    ldap_max_objects,
+                )
+                .await;
             }
             Command::CheckForUpdate => {
                 check_for_update(&http_for_update, &reporter).await;
@@ -811,7 +844,7 @@ async fn load_directory<F: Fn() + Send + 'static>(
     settings: Option<&crate::config::Directory>,
     reporter: &Reporter<F>,
     collection: Collection,
-    password: &crate::mariadb::Secret,
+    password: Option<&crate::mariadb::Secret>,
     page_size: i32,
     max_objects: u32,
 ) {
@@ -850,11 +883,82 @@ async fn load_directory<F: Fn() + Send + 'static>(
     }
 }
 
+/// Perform one on-premises change, or refuse it.
+///
+/// The on-premises twin of [`execute`], and deliberately the same sequence:
+/// refuse unless write mode is armed, record the attempt before the call goes
+/// out, record the outcome after, then re-read so the console shows what is
+/// actually there rather than what the write was supposed to have done.
+///
+/// It is a separate function only because the destination differs. Sharing the
+/// write gate by copying these four steps is the point — an on-premises write
+/// that skipped the audit log, or that answered to no gate, would be a hole in
+/// exactly the guarantee the tenant side is careful about.
+///
+/// The second gate is not here and cannot be: Active Directory decides for
+/// itself whether the bound account may do this, and under integrated
+/// authentication that account is the operator's own.
+#[allow(clippy::too_many_arguments, reason = "the reload needs the paging limits")]
+async fn execute_directory<F: Fn() + Send + 'static>(
+    settings: Option<&crate::config::Directory>,
+    reporter: &Reporter<F>,
+    write_armed: bool,
+    action: &crate::ldap::actions::DirectoryAction,
+    password: Option<&crate::mariadb::Secret>,
+    refresh: Collection,
+    page_size: i32,
+    max_objects: u32,
+) {
+    if !write_armed {
+        reporter.send(Event::WriteRejected(action.label()));
+        return;
+    }
+
+    let Some(settings) = settings else {
+        reporter.send(Event::ActionResult {
+            label: action.label(),
+            result: Err("No [directory] section is configured.".into()),
+        });
+        return;
+    };
+
+    // Whoever the domain controller will actually evaluate this against, which
+    // under integrated authentication is the signed-in Windows account rather
+    // than the Entra account gcm signed in with. Logging the latter would name
+    // the wrong person on the one line that matters.
+    let actor = crate::ldap::acting_identity(settings);
+
+    actionlog::record_directory_attempt(action, Some(&actor));
+
+    let result = crate::ldap::apply(settings, password, action)
+        .await
+        .map_err(|err| format!("{err:#}"));
+
+    actionlog::record_directory_outcome(action, Some(&actor), &result);
+
+    reporter.send(Event::ActionResult {
+        label: action.label(),
+        result: result.clone(),
+    });
+
+    if result.is_ok() {
+        load_directory(
+            Some(settings),
+            reporter,
+            refresh,
+            password,
+            page_size,
+            max_objects,
+        )
+        .await;
+    }
+}
+
 /// Check the bind credentials without reading a collection.
 async fn verify_directory_bind<F: Fn() + Send + 'static>(
     settings: Option<&crate::config::Directory>,
     reporter: &Reporter<F>,
-    password: &crate::mariadb::Secret,
+    password: Option<&crate::mariadb::Secret>,
 ) {
     let Some(settings) = settings else {
         reporter.send(Event::DirectoryBindFailed(

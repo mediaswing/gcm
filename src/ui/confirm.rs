@@ -13,13 +13,28 @@ use egui::{Color32, RichText};
 
 use super::theme;
 use crate::graph::actions::{Action, Severity};
+use crate::ldap::actions::DirectoryAction;
 
-/// One or more actions waiting for the operator to approve or reject them.
+/// What is waiting to be approved.
+///
+/// The two cannot be mixed in one dialog, and that is deliberate: approving a
+/// tenant change and an on-premises change together would obscure that they
+/// land in different directories, with different blast radiuses, under
+/// different permissions.
+pub enum Subject {
+    /// One or more tenant changes, confirmed as a unit.
+    Tenant(Vec<Action>),
+    /// One on-premises change. Never batched — the AD panes act on a single
+    /// selected object.
+    Directory(Box<DirectoryAction>),
+}
+
+/// Actions waiting for the operator to approve or reject them.
 ///
 /// A batch is confirmed as a unit, because approving twelve wipes one dialog at
 /// a time trains exactly the reflex this is meant to defeat.
 pub struct Pending {
-    pub actions: Vec<Action>,
+    pub subject: Subject,
     /// What the operator has typed into the confirmation field.
     pub typed: String,
     /// Set once, to move focus into the field on the first frame.
@@ -29,19 +44,43 @@ pub struct Pending {
 impl Pending {
     pub fn new(actions: Vec<Action>) -> Self {
         Self {
-            actions,
+            subject: Subject::Tenant(actions),
             typed: String::new(),
             focused: false,
         }
     }
 
+    /// A single on-premises change, confirmed by exactly the same rules.
+    ///
+    /// Routing AD writes through this dialog rather than a parallel one is
+    /// what stops the two drifting: a destructive change still has to be
+    /// typed out, whichever directory it lands in.
+    pub fn for_directory(action: DirectoryAction) -> Self {
+        Self {
+            subject: Subject::Directory(Box::new(action)),
+            typed: String::new(),
+            focused: false,
+        }
+    }
+
+    /// The tenant actions, if that is what this is.
+    fn tenant_actions(&self) -> &[Action] {
+        match &self.subject {
+            Subject::Tenant(actions) => actions,
+            Subject::Directory(_) => &[],
+        }
+    }
+
     /// The most dangerous severity in the batch governs the whole batch.
     pub fn severity(&self) -> Severity {
-        self.actions
-            .iter()
-            .map(Action::severity)
-            .max()
-            .unwrap_or(Severity::Safe)
+        match &self.subject {
+            Subject::Tenant(actions) => actions
+                .iter()
+                .map(Action::severity)
+                .max()
+                .unwrap_or(Severity::Safe),
+            Subject::Directory(action) => action.severity(),
+        }
     }
 
     /// What the operator must type, if anything.
@@ -53,29 +92,43 @@ impl Pending {
         if self.severity() != Severity::Destructive {
             return None;
         }
-        match self.actions.as_slice() {
-            [] => None,
-            [single] => single.confirm_phrase(),
-            many => Some(format!("{} {}", many[0].verb(), many.len())),
+        match &self.subject {
+            // A single on-premises deletion names its target, for the same
+            // reason a single tenant one does: it forces the eye onto *which*
+            // object is about to go.
+            Subject::Directory(action) => Some(action.target_name().to_string()),
+            Subject::Tenant(actions) => match actions.as_slice() {
+                [] => None,
+                [single] => single.confirm_phrase(),
+                many => Some(format!("{} {}", many[0].verb(), many.len())),
+            },
         }
     }
 
     /// One line describing the whole batch.
     pub fn label(&self) -> String {
-        match self.actions.as_slice() {
-            [] => String::new(),
-            [single] => single.label(),
-            many => format!("{} {} objects", capitalise(many[0].verb()), many.len()),
+        match &self.subject {
+            Subject::Directory(action) => action.label(),
+            Subject::Tenant(actions) => match actions.as_slice() {
+                [] => String::new(),
+                [single] => single.label(),
+                many => format!("{} {} objects", capitalise(many[0].verb()), many.len()),
+            },
         }
     }
 
     /// Warning text, when every action in the batch shares one.
     fn consequence(&self) -> Option<&'static str> {
-        let first = self.actions.first()?.consequence()?;
-        self.actions
-            .iter()
-            .all(|action| action.consequence() == Some(first))
-            .then_some(first)
+        match &self.subject {
+            Subject::Directory(action) => action.consequence(),
+            Subject::Tenant(actions) => {
+                let first = actions.first()?.consequence()?;
+                actions
+                    .iter()
+                    .all(|action| action.consequence() == Some(first))
+                    .then_some(first)
+            }
+        }
     }
 
     /// Whether the typed text satisfies the confirmation requirement.
@@ -145,13 +198,13 @@ pub fn action_modal(ctx: &egui::Context, pending: &mut Pending) -> Outcome {
 
         // For a batch, name every object. Being able to see what is in the set
         // is the whole reason a bulk confirmation is trustworthy.
-        if pending.actions.len() > 1 {
+        if pending.tenant_actions().len() > 1 {
             ui.add_space(8.0);
             egui::ScrollArea::vertical()
                 .max_height(160.0)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    for action in &pending.actions {
+                    for action in pending.tenant_actions() {
                         ui.label(
                             RichText::new(format!("• {}", action.target_name()))
                                 .small()

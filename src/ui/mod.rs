@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText};
 
-use crate::config::{Config, config_path};
+use crate::config::{Config, source_label};
 use crate::graph::Fetch;
 use crate::graph::actions::{Action, Severity};
 use crate::graph::models::*;
@@ -1249,13 +1249,17 @@ impl App {
                 self.status = "Connected to Active Directory".into();
                 // The bind was only ever a credential check; the collection
                 // that wanted it still has to be read.
-                if let Some(collection) = self.directory_pending.take()
-                    && let Some(password) = self.directory_password.clone()
-                {
-                    self.send(Command::LoadDirectory {
-                        collection,
-                        password,
-                    });
+                if let Some(collection) = self.directory_pending.take() {
+                    // Integrated authentication carries no password; a simple
+                    // bind has just proved one. Either is a reason to read,
+                    // but "neither" is not.
+                    let password = self.directory_password.clone();
+                    if password.is_some() || self.directory_is_integrated() {
+                        self.send(Command::LoadDirectory {
+                            collection,
+                            password,
+                        });
+                    }
                 }
             }
             Event::DirectoryBindFailed(message) => {
@@ -1427,6 +1431,63 @@ impl App {
         } else {
             self.pending = Some(confirm::Pending::new(actions));
         }
+    }
+
+    /// Put one on-premises change through the same gate and the same
+    /// confirmation as a tenant change.
+    ///
+    /// Not merged with [`Self::request_actions`] because the two carry
+    /// different action types, but the sequence is deliberately identical —
+    /// gate, then confirm unless it is safe, then dispatch. An on-premises
+    /// write that skipped either step would be a hole in the guarantee the
+    /// tenant side is careful about.
+    fn request_directory_action(&mut self, action: crate::ldap::actions::DirectoryAction) {
+        if !self.write_mode.is_armed() {
+            self.status = "Write mode is off — press Ctrl+Shift+W to enable it".into();
+            return;
+        }
+
+        self.touch();
+
+        if action.severity() == Severity::Safe {
+            self.dispatch_directory(action);
+        } else {
+            self.pending = Some(confirm::Pending::for_directory(action));
+        }
+    }
+
+    /// Send a confirmed on-premises change to the worker.
+    ///
+    /// `refresh` is the view being looked at, because a DN does not say
+    /// whether it belongs to a user or a computer and the wrong pane would
+    /// otherwise be re-read.
+    fn dispatch_directory(&mut self, action: crate::ldap::actions::DirectoryAction) {
+        let refresh = self
+            .view
+            .collection()
+            .filter(|collection| collection.is_directory())
+            .unwrap_or(Collection::AdUsers);
+
+        if self.worker.is_some() {
+            self.send(Command::DirectoryAction {
+                action: Box::new(action),
+                password: self.directory_password.clone(),
+                refresh,
+            });
+            return;
+        }
+
+        // Demo mode has no domain controller to write to, and pretending
+        // otherwise would make the AD panes look writable when they are not.
+        #[cfg(debug_assertions)]
+        self.handle_event(Event::ActionResult {
+            label: action.label(),
+            result: Err(
+                "Demo mode has no domain controller, so on-premises changes are not \
+                 simulated."
+                    .into(),
+            ),
+        });
     }
 
     /// Note that the operator did something, deferring the idle timeout.
@@ -1999,7 +2060,9 @@ impl App {
                     // it, so a rejected password is never left behind for the
                     // next view to retry with.
                     self.directory_password = Some(password.clone());
-                    self.send(Command::VerifyDirectoryBind { password });
+                    self.send(Command::VerifyDirectoryBind {
+                        password: Some(password),
+                    });
                     // Kept open, showing "Connecting…", until the worker either
                     // confirms the bind or says why it was refused.
                     self.directory_prompt = Some(prompt);
@@ -2040,6 +2103,7 @@ impl App {
         if let Some(mut palette) = self.palette.take() {
             match menu::palette(ctx, &mut palette, self.write_mode.is_armed()) {
                 menu::Chosen::Act(actions) => self.request_actions(actions),
+                menu::Chosen::ActDirectory(action) => self.request_directory_action(*action),
                 menu::Chosen::Open(form) => self.open_form(form.build()),
                 menu::Chosen::View(command) => self.run_view_command(ctx, command),
                 menu::Chosen::Cancelled => {}
@@ -2054,6 +2118,9 @@ impl App {
             match forms::show(ctx, &mut form, &self.store) {
                 forms::Outcome::Submit(action) => {
                     self.request_action(*action);
+                }
+                forms::Outcome::SubmitDirectory(action) => {
+                    self.request_directory_action(*action);
                 }
                 forms::Outcome::Cancelled => {}
                 forms::Outcome::Pending => self.form = Some(form),
@@ -2096,14 +2163,17 @@ impl App {
 
         match confirm::action_modal(ctx, pending) {
             confirm::Outcome::Confirmed => {
-                let actions = self.pending.take().expect("pending was just borrowed").actions;
+                let subject = self.pending.take().expect("pending was just borrowed").subject;
                 // Re-check the gate at the moment of execution: write mode can
                 // expire while a confirmation sits open.
-                if self.write_mode.is_armed() {
-                    self.touch();
-                    self.dispatch_many(actions);
-                } else {
+                if !self.write_mode.is_armed() {
                     self.status = "Write mode expired before that was confirmed".into();
+                    return;
+                }
+                self.touch();
+                match subject {
+                    confirm::Subject::Tenant(actions) => self.dispatch_many(actions),
+                    confirm::Subject::Directory(action) => self.dispatch_directory(*action),
                 }
             }
             confirm::Outcome::Cancelled => {
@@ -2367,6 +2437,24 @@ impl App {
             for item in items {
                 match item {
                     menu::Item::Separator => {}
+                    menu::Item::ActDirectory { label, action } => {
+                        let destructive = action.severity() == Severity::Destructive;
+                        let text = if destructive {
+                            RichText::new(&label)
+                                .color(if armed { theme::BAD } else { theme::MUTED })
+                        } else {
+                            RichText::new(&label)
+                        };
+                        if ui
+                            .add_enabled(armed, egui::Button::new(text))
+                            .on_disabled_hover_text(
+                                "Enable write mode (Ctrl+Shift+W) to use this",
+                            )
+                            .clicked()
+                        {
+                            self.request_directory_action(*action);
+                        }
+                    }
                     menu::Item::Act { label, action } => {
                         let destructive = action.severity() == Severity::Destructive;
                         let text = if destructive {
@@ -2502,7 +2590,7 @@ impl App {
         let Some(settings) = self.mariadb.clone() else {
             self.status = format!(
                 "No [mariadb] section in {} — add one to enable this",
-                config_path().display()
+                source_label()
             );
             return;
         };
@@ -2656,16 +2744,35 @@ impl App {
             return;
         }
 
+        // Integrated authentication has nothing to ask for: the read binds as
+        // the signed-in Windows account, so the dialog would be a prompt for a
+        // credential that is not used. Straight to the read.
+        if self.directory_is_integrated() {
+            self.send(Command::LoadDirectory {
+                collection,
+                password: None,
+            });
+            return;
+        }
+
         match self.directory_password.clone() {
             Some(password) => self.send(Command::LoadDirectory {
                 collection,
-                password,
+                password: Some(password),
             }),
             None => {
                 self.directory_pending = Some(collection);
                 self.directory_prompt = Some(directory::Prompt::new());
             }
         }
+    }
+
+    /// Whether the domain controller is reached as the signed-in Windows
+    /// account, and so needs no password collected for it.
+    fn directory_is_integrated(&self) -> bool {
+        self.directory
+            .as_ref()
+            .is_some_and(crate::config::Directory::uses_integrated_auth)
     }
 
     fn sign_in_screen(&mut self, ui: &mut egui::Ui, url: Option<String>) {
@@ -2749,8 +2856,27 @@ impl App {
                 if ui.button("Open the configuration folder").clicked() {
                     let _ = open::that_detached(crate::config::config_dir());
                 }
+                // A file path is worth copying because somebody can open it.
+                // A registry key path is not — so on Windows this hands over
+                // the configuration itself, rendered back into the documented
+                // file format. That is what the file backend's "safe to paste
+                // into a support ticket" property becomes when the settings
+                // move into the registry; neither form contains a password.
+                #[cfg(windows)]
+                if ui
+                    .button("Copy the configuration")
+                    .on_hover_text(format!(
+                        "Copies the contents of {} as INI text. It contains no passwords.",
+                        crate::config::source_label()
+                    ))
+                    .clicked()
+                {
+                    ui.ctx().copy_text(crate::registry::export_ini());
+                }
+                #[cfg(not(windows))]
                 if ui.button("Copy the file path").clicked() {
-                    ui.ctx().copy_text(config_path().display().to_string());
+                    ui.ctx()
+                        .copy_text(crate::config::config_path().display().to_string());
                 }
                 if ui
                     .button("Open the error log")
