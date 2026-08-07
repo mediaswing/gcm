@@ -1,14 +1,26 @@
 # gcm — Graphical Cloud Manager
 
-A Microsoft 365 administration console for the desktop, written in Rust. It
-presents users, groups and directory roles, Entra and Intune-managed devices,
-licence consumption, Exchange mailboxes, Teams, and the sign-in and audit logs
-in the shape of a classic MMC snap-in: a scope tree on the left, a result list
-in the middle, a property sheet on the right.
+A directory administration console for the desktop, written in Rust, covering
+both halves of a hybrid estate.
+
+**Microsoft 365** — users, groups and directory roles, Entra and Intune-managed
+devices, licence consumption, Exchange mailboxes, Teams, and the sign-in and
+audit logs. **On-premises Active Directory** — users and computers read straight
+from a domain controller, with each synced account joined to its on-premises
+object so the OU it lives in, its `userAccountControl` flags and when its
+password was really last set sit on the same property sheet as the cloud half.
+
+All of it in the shape of a classic MMC snap-in: a scope tree on the left, a
+result list in the middle, a property sheet on the right.
 
 Everything in it is reachable from the keyboard. It opens **read-only every
 time**, and changing anything requires deliberately arming write mode — see
 [Making changes](#making-changes).
+
+Changes to Active Directory carry a second gate that tenant changes do not: on
+Windows gcm binds as the signed-in operator, so the domain controller enforces
+whatever has been delegated to *them*, rather than a shared service account's
+rights standing in for everybody.
 
 ```
 ┌──────────────┬───────────────────────────────┬──────────────────┐

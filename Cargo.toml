@@ -2,7 +2,7 @@
 name = "gcm"
 version = "1.6.0"
 edition = "2024"
-description = "Graphical Cloud Manager — an MMC-style Microsoft 365 admin console"
+description = "Graphical Cloud Manager — an MMC-style console for Microsoft 365 and on-premises Active Directory"
 license = "MIT"
 readme = "README.md"
 

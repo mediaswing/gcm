@@ -1,12 +1,21 @@
 //! gcm — Graphical Cloud Manager
 //!
-//! A Microsoft 365 administration console: users, groups and directory roles,
-//! Entra and Intune-managed devices, and licence consumption, in an MMC-style
-//! three-pane window that works entirely from the keyboard.
+//! A directory administration console covering both halves of a hybrid estate:
+//! Microsoft 365 — users, groups and directory roles, Entra and Intune-managed
+//! devices, licence consumption, Exchange and Teams — and the on-premises
+//! Active Directory beside it, with each synced account joined to its
+//! on-premises object. An MMC-style three-pane window that works entirely from
+//! the keyboard.
 //!
 //! It opens read-only and stays that way until write mode is deliberately
 //! armed; the gate itself lives in [`worker`], the single point every mutation
-//! passes through.
+//! passes through — for the tenant and for the domain alike.
+//!
+//! Which permissions a change is evaluated against differs between the two.
+//! Graph applies the app registration's scopes, identically for everybody.
+//! A domain controller applies the bound account's rights — and on Windows
+//! that is the signed-in operator's own, so AD delegations carry through
+//! without gcm knowing anything about them. See [`ldap`].
 
 // This is a GUI application; opening a console window behind it on Windows
 // would be noise.
