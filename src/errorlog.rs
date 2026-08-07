@@ -12,11 +12,12 @@
 //!
 //! ## Where it lives
 //!
-//! Alongside `config.ini` and `actions.log` in gcm's own directory, rather than
-//! loose in the home directory: it is gcm's file, it belongs with gcm's other
-//! files, and there is then exactly one folder to send when somebody asks for
-//! diagnostics. The path is shown in the console — under Keyboard help, and on
-//! the failure screen — because a log nobody can find is not a diagnostic.
+//! Alongside `actions.log` (and, off Windows, `config.ini`) in gcm's own
+//! directory, rather than loose in the home directory: it is gcm's file, it
+//! belongs with gcm's other files, and there is then exactly one folder to
+//! send when somebody asks for diagnostics. The path is shown in the console
+//! — under Keyboard help, and on the failure screen — because a log nobody
+//! can find is not a diagnostic.
 //!
 //! ## What it does not contain
 //!

@@ -304,6 +304,16 @@ fn extract_zip(bytes: &[u8], into: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Double every `%` in a path so it can sit inside a double-quoted batch
+/// string without cmd.exe reading part of it as a `%VAR%` expansion — the one
+/// character batch syntax treats specially even inside quotes. Install and
+/// temp directories are named by Windows and the user, not by gcm, so a
+/// literal `%` is rare but not impossible.
+#[cfg(windows)]
+fn bat_escape(path: &std::path::Path) -> String {
+    path.display().to_string().replace('%', "%%")
+}
+
 /// Write a batch script that waits for this process to exit, copies the new
 /// build over the install directory, relaunches it, and deletes itself, then
 /// spawn it detached so it survives this process ending.
@@ -339,9 +349,9 @@ rmdir /s /q "{src}"
 del "%~f0"
 "#,
         pid = pid,
-        src = payload.display(),
-        dest = install_dir.display(),
-        exe = exe.display(),
+        src = bat_escape(payload),
+        dest = bat_escape(install_dir),
+        exe = bat_escape(exe),
     );
 
     std::fs::write(&script_path, script).context("writing the update helper script")?;
@@ -572,6 +582,23 @@ mod tests {
         assert!(is_newer("1.3.0", "1.2.0"));
         assert!(is_newer("2.0.0", "1.9.9"));
         assert!(is_newer("1.2.1", "1.2.0"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_percent_in_a_path_cannot_start_a_batch_expansion() {
+        // The failure this exists to stop: an install directory like
+        // `C:\Users\100% Sure\gcm` would otherwise hand `%PID%`-style syntax
+        // to cmd.exe, and `%Sure%` would silently expand to whatever that
+        // environment variable holds (usually nothing).
+        assert_eq!(
+            bat_escape(std::path::Path::new(r"C:\Users\100% Sure\gcm")),
+            r"C:\Users\100%% Sure\gcm"
+        );
+        assert_eq!(
+            bat_escape(std::path::Path::new(r"C:\plain\path")),
+            r"C:\plain\path"
+        );
     }
 
     #[test]

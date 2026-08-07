@@ -2853,6 +2853,12 @@ impl App {
 
             ui.add_space(16.0);
             ui.horizontal(|ui| {
+                // Nothing to open on Windows: the configuration lives in the
+                // registry, not in this folder, which holds only the logs
+                // "Open the error log" below already reaches. Offering it
+                // there would send somebody looking for config.ini into a
+                // folder that has never had one.
+                #[cfg(not(windows))]
                 if ui.button("Open the configuration folder").clicked() {
                     let _ = open::that_detached(crate::config::config_dir());
                 }
