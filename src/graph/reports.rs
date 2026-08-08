@@ -19,7 +19,7 @@
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 
-use super::models::Mailbox;
+use super::models::{Mailbox, MailboxSource};
 
 /// Column headings this parser knows how to read, in the order the details
 /// pane presents them. Anything else in the file is ignored.
@@ -90,6 +90,7 @@ pub fn parse_mailbox_usage(csv_text: &str) -> Result<Vec<Mailbox>> {
             deleted_item_count: parse_i64(field(columns.deleted_item_count)),
             deleted_item_size: parse_i64(field(columns.deleted_item_size)),
             has_archive: parse_bool(field(columns.has_archive)),
+            source: MailboxSource::Report,
         };
 
         // A row with no identity at all is a trailing blank line, not a mailbox.

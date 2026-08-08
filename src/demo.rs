@@ -115,6 +115,19 @@ pub fn users() -> Arc<Vec<User>> {
             } else {
                 vec![]
             },
+            // What makes a mailbox appear in the list before the usage report
+            // has caught up with it. Five of these people are deliberately
+            // absent from the report fixture below, so the demo shows the
+            // union doing its job rather than only the reported half.
+            assigned_plans: if *enabled {
+                vec![AssignedPlan {
+                    service: Some("exchange".into()),
+                    service_plan_id: Some("plan-exchange-standard".into()),
+                    capability_status: Some("Enabled".into()),
+                }]
+            } else {
+                vec![]
+            },
             business_phones: vec!["+44 20 7946 0000".into()],
             proxy_addresses: vec![
                 format!("SMTP:{alias}@contoso.co.uk"),
@@ -466,6 +479,7 @@ pub fn mailboxes() -> Fetch<Arc<Vec<Mailbox>>> {
                 deleted_item_count: *items / 20,
                 deleted_item_size: GIGABYTE / 2,
                 has_archive: Some(index % 2 == 0),
+                source: MailboxSource::Report,
             }
         })
         .collect();

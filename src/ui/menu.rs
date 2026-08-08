@@ -710,11 +710,7 @@ fn team_items(app: &App, source: usize) -> Vec<Item> {
 }
 
 fn mailbox_items(app: &App, source: usize) -> Vec<Item> {
-    let mailboxes = match &app.store.mailboxes {
-        Some(Fetch::Ready(mailboxes)) => mailboxes,
-        _ => return Vec::new(),
-    };
-    let Some(mailbox) = mailboxes.get(source) else {
+    let Some(mailbox) = app.store.mailbox_rows.get(source) else {
         return Vec::new();
     };
 

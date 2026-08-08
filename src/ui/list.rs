@@ -235,7 +235,7 @@ fn cell(app: &App, view: View, source: usize, column: usize) -> String {
                 0 => mailbox.name().to_string(),
                 1 => mailbox.upn().to_string(),
                 2 => mailbox.storage_display(),
-                3 => mailbox.item_count.to_string(),
+                3 => mailbox.item_count_display(),
                 4 => fmt_day(&mailbox.last_activity),
                 _ => String::new(), // drawn as a bar
             },
@@ -310,7 +310,7 @@ fn managed(app: &App) -> &[ManagedDevice] {
 }
 
 fn mailboxes(app: &App) -> &[Mailbox] {
-    ready(&app.store.mailboxes)
+    &app.store.mailbox_rows
 }
 
 fn teams(app: &App) -> &[Team] {
@@ -1008,7 +1008,13 @@ pub fn row_label(app: &App, view: View, source: usize) -> String {
 fn usage_fraction(app: &App, view: View, source: usize) -> Option<f32> {
     match view {
         View::Licenses => app.store.licenses.get(source).map(|sku| sku.usage_fraction()),
-        View::Mailboxes => mailboxes(app).get(source).map(|mb| mb.usage_fraction()),
+        // No bar at all for a mailbox the report has not reached. A bar sitting
+        // at zero is a claim that the mailbox is empty, and nothing here knows
+        // that — the figures simply are not in yet.
+        View::Mailboxes => mailboxes(app)
+            .get(source)
+            .filter(|mailbox| mailbox.metrics_known())
+            .map(|mailbox| mailbox.usage_fraction()),
         _ => None,
     }
 }
@@ -1025,13 +1031,18 @@ fn usage_text(app: &App, view: View, source: usize) -> String {
             .unwrap_or_default(),
         View::Mailboxes => mailboxes(app)
             .get(source)
-            .map(|mailbox| match mailbox.quota() {
-                0 => format!("{} used, no quota set", fmt_bytes(mailbox.storage_used)),
-                quota => format!(
-                    "{} of {} used",
-                    fmt_bytes(mailbox.storage_used),
-                    fmt_bytes(quota)
-                ),
+            .map(|mailbox| {
+                if !mailbox.metrics_known() {
+                    return "Size not yet in the usage report".to_string();
+                }
+                match mailbox.quota() {
+                    0 => format!("{} used, no quota set", fmt_bytes(mailbox.storage_used)),
+                    quota => format!(
+                        "{} of {} used",
+                        fmt_bytes(mailbox.storage_used),
+                        fmt_bytes(quota)
+                    ),
+                }
             })
             .unwrap_or_default(),
         _ => String::new(),

@@ -888,7 +888,27 @@ fn mailbox_details(app: &mut App, ui: &mut egui::Ui) {
 
     field(ui, "Mailbox", mailbox.upn());
     field(ui, "Size", &mailbox.storage_display());
-    field(ui, "Items", &mailbox.item_count.to_string());
+    field(ui, "Items", &mailbox.item_count_display());
+
+    // Everything below the identity comes from the usage report, so for a
+    // mailbox the report has not reached there is nothing to draw — and a 0%
+    // quota bar would be an assertion rather than an absence. Said once, here,
+    // instead of dashing out eight fields one at a time.
+    if !mailbox.metrics_known() {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(
+                "This mailbox is not in the usage report yet, so its size, quota and \
+                 activity are unknown. The report is compiled once a day; a mailbox \
+                 created since the last run appears here from the directory instead, \
+                 and its figures arrive tomorrow.",
+            )
+            .small()
+            .color(theme::MUTED),
+        );
+        settings_section(app, ui, &mailbox);
+        return;
+    }
 
     let percent = format!("{:.0}%", mailbox.usage_fraction() * 100.0);
     field_colored(
@@ -937,11 +957,21 @@ fn mailbox_details(app: &mut App, ui: &mut egui::Ui) {
         );
     }
 
+    settings_section(app, ui, &mailbox);
+}
+
+/// The live half of the mailbox pane: automatic replies and the mailbox's own
+/// settings, both read per-mailbox from Graph rather than from the report.
+///
+/// Split out because it is the one part that works for a mailbox the report has
+/// not reached — `/users/{id}/mailboxSettings` answers for a mailbox created
+/// minutes ago — so both paths through the pane end here.
+fn settings_section(app: &mut App, ui: &mut egui::Ui, mailbox: &Mailbox) {
     section(ui, "AUTOMATIC REPLIES");
     match app
         .store
         .mailbox_settings
-        .get(App::mailbox_settings_key(&mailbox))
+        .get(App::mailbox_settings_key(mailbox))
     {
         None => loading(ui),
         Some(Fetch::Unavailable(reason)) => {

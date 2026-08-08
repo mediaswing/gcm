@@ -10,6 +10,28 @@ someone reading the diff.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 gcm uses [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The mailbox list is live.** It came from the `getMailboxUsageDetail`
+  report, which Microsoft compiles once a day, so a mailbox created this
+  morning did not appear until tomorrow. Accounts holding an enabled Exchange
+  service plan are now folded in from the directory as well, and show up at
+  once — marked **Not yet reported** where their size, quota and activity would
+  be, because Graph exposes no mailbox size or quota at any freshness.
+
+  The two sources miss different things, so the view unions them rather than
+  choosing: the report still supplies every figure, and the shared, room and
+  equipment mailboxes that hold no licence and so are invisible to the
+  directory. Rows the report supplied win where both know a mailbox, and
+  unreported rows sort below every reported one — the list orders by fullness,
+  and a mailbox with no figures is not an empty one.
+
+  This costs no extra request: the Users collection was already loaded, and
+  only needed one more property asked for. A tenant that conceals report
+  identities is left alone, since there is then no address to join on.
+
 ## [1.7.0] - 2026-08-07
 
 ### Fixed

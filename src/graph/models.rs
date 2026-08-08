@@ -78,6 +78,11 @@ pub struct User {
     pub usage_location: Option<String>,
     #[serde(default)]
     pub assigned_licenses: Vec<AssignedLicense>,
+    /// Service plans actually provisioned on the account, as opposed to the
+    /// SKUs assigned to it. Carried because it is the only live signal Graph
+    /// offers for "this account has a mailbox" — see [`User::has_mailbox`].
+    #[serde(default)]
+    pub assigned_plans: Vec<AssignedPlan>,
     #[serde(default)]
     pub business_phones: Vec<String>,
     #[serde(default)]
@@ -85,6 +90,30 @@ pub struct User {
 }
 
 impl User {
+    /// Whether this account has an Exchange Online mailbox behind it.
+    ///
+    /// The closest thing Graph offers to a live mailbox list. `assignedPlans`
+    /// reflects what has actually been provisioned, rather than what a licence
+    /// entitles the account to, so it turns up as soon as the mailbox does —
+    /// which is the whole point, the usage report being a day behind.
+    ///
+    /// Two things it deliberately does not catch, both of which the report does
+    /// so the union covers them. Shared, room and equipment mailboxes hold no
+    /// licence and so have no plans. And an account whose Exchange plan is
+    /// suspended or in its grace period is excluded, because `Warning` and
+    /// `Suspended` are states in which the mailbox may already be gone.
+    pub fn has_mailbox(&self) -> bool {
+        self.assigned_plans.iter().any(|plan| {
+            plan.service
+                .as_deref()
+                .is_some_and(|service| service.eq_ignore_ascii_case("exchange"))
+                && plan
+                    .capability_status
+                    .as_deref()
+                    .is_some_and(|status| status.eq_ignore_ascii_case("Enabled"))
+        })
+    }
+
     pub fn name(&self) -> &str {
         self.display_name
             .as_deref()
@@ -112,6 +141,7 @@ pub struct AssignedLicense {
     #[serde(default)]
     pub disabled_plans: Vec<String>,
 }
+
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -462,12 +492,21 @@ pub struct VerifiedDomain {
     pub is_initial: Option<bool>,
 }
 
+/// One provisioned service plan, on the tenant or on an account.
+///
+/// `service` is a coarse workload name — `exchange`, `SharePoint`,
+/// `MicrosoftOffice` — and `capability_status` says whether it is actually
+/// live: `Enabled`, `Warning` during a grace period, `Suspended`, or `Deleted`.
+///
+/// Read in two places for two different questions: whether the tenant has
+/// Intune at all, and whether an account has a mailbox — see
+/// [`User::has_mailbox`].
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AssignedPlan {
     pub service: Option<String>,
-    /// Retained to mirror the Graph resource; Intune detection keys off
-    /// `service` because plan GUIDs change between offerings.
+    /// Retained to mirror the Graph resource; both callers key off `service`
+    /// because plan GUIDs change between offerings.
     #[allow(dead_code)]
     pub service_plan_id: Option<String>,
     pub capability_status: Option<String>,
@@ -949,12 +988,34 @@ impl Channel {
 
 // ---- Exchange Online --------------------------------------------------------
 
-/// One mailbox, from the `getMailboxUsageDetail` report.
+/// Where a row in the mailbox list came from.
 ///
-/// Graph has no "list every mailbox" collection, so this comes out of the usage
-/// report instead — which has the happy side effect of carrying the numbers an
-/// administrator actually opens Exchange for: size against quota, item count,
-/// and when the mailbox was last touched.
+/// The two sources answer different halves of the question and neither is
+/// sufficient alone, which is why the view unions them rather than choosing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MailboxSource {
+    /// The `getMailboxUsageDetail` report: carries every number the view shows,
+    /// and includes shared, room and equipment mailboxes that hold no licence.
+    /// Compiled daily, so it does not know about this morning yet.
+    #[default]
+    Report,
+    /// `/users`, because the account holds an enabled Exchange service plan.
+    /// Live, so a mailbox created minutes ago appears — but carries no size,
+    /// no quota and no activity, because Graph exposes none of them.
+    Directory,
+}
+
+/// One mailbox.
+///
+/// Graph has no "list every mailbox" collection, so the bulk of this comes out
+/// of the `getMailboxUsageDetail` report — which has the happy side effect of
+/// carrying the numbers an administrator actually opens Exchange for: size
+/// against quota, item count, and when the mailbox was last touched.
+///
+/// The report is compiled once a day, which used to mean a mailbox created this
+/// morning simply was not in the list. Accounts holding an enabled Exchange plan
+/// are therefore folded in from `/users` as well, so the list is live even
+/// though the numbers on it cannot be — see [`MailboxSource`].
 #[derive(Debug, Clone, Default)]
 pub struct Mailbox {
     pub user_principal_name: String,
@@ -970,9 +1031,35 @@ pub struct Mailbox {
     pub deleted_item_count: i64,
     pub deleted_item_size: i64,
     pub has_archive: Option<bool>,
+    pub source: MailboxSource,
 }
 
 impl Mailbox {
+    /// A mailbox the directory knows about but the report has not reached.
+    ///
+    /// Everything numeric is left at zero and reads as unknown rather than as
+    /// empty — see [`Self::metrics_known`]. `created` is the *account's*
+    /// creation date, which for a mailbox this new is the closest true thing
+    /// there is, and the row says where it came from.
+    pub fn from_directory(user: &User) -> Self {
+        Self {
+            user_principal_name: user.user_principal_name.clone().unwrap_or_default(),
+            display_name: user.display_name.clone().unwrap_or_default(),
+            created: user.created_date_time.map(|created| created.date_naive()),
+            source: MailboxSource::Directory,
+            ..Default::default()
+        }
+    }
+
+    /// Whether the size, quota and activity figures on this row mean anything.
+    ///
+    /// False for a mailbox that only the directory knows about. The distinction
+    /// has to reach the UI: a row showing `0 bytes of 100 GB` is a claim about
+    /// an empty mailbox, and nothing here knows that to be true.
+    pub fn metrics_known(&self) -> bool {
+        self.source == MailboxSource::Report
+    }
+
     pub fn name(&self) -> &str {
         if self.display_name.trim().is_empty() {
             self.upn()
@@ -1013,9 +1100,21 @@ impl Mailbox {
     }
 
     pub fn storage_display(&self) -> String {
+        if !self.metrics_known() {
+            return "Not yet reported".into();
+        }
         match self.quota() {
             0 => fmt_bytes(self.storage_used),
             quota => format!("{} of {}", fmt_bytes(self.storage_used), fmt_bytes(quota)),
+        }
+    }
+
+    /// The item count as text, or a dash where there is no figure to give.
+    pub fn item_count_display(&self) -> String {
+        if self.metrics_known() {
+            self.item_count.to_string()
+        } else {
+            "—".into()
         }
     }
 

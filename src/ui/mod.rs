@@ -238,7 +238,17 @@ struct Store {
     sign_ins: Option<Fetch<Arc<Vec<SignIn>>>>,
     audits: Option<Fetch<Arc<Vec<DirectoryAudit>>>>,
     teams: Option<Fetch<Arc<Vec<Team>>>>,
+    /// The usage report, exactly as it arrived. Not what the view shows — see
+    /// `mailbox_rows`.
     mailboxes: Option<Fetch<Arc<Vec<Mailbox>>>>,
+    /// What the Mailboxes view actually lists: the report's rows plus every
+    /// mailbox `users` knows about that the report has not caught up with,
+    /// ordered fullest first.
+    ///
+    /// Rebuilt by `set_mailboxes` and `set_users`, and the only list the view's
+    /// row indices point into. Held separately from `mailboxes` so a refresh of
+    /// either half cannot leave the union stale.
+    mailbox_rows: Arc<Vec<Mailbox>>,
     /// On-premises accounts, when a domain controller is configured and has
     /// been bound to. `Unavailable` covers the ordinary cloud-only case.
     ad_users: Option<Fetch<Arc<Vec<AdUser>>>>,
@@ -297,7 +307,11 @@ impl Store {
             View::Devices => Some(self.devices.len()),
             View::Licenses => Some(self.licenses.len()),
             View::ManagedDevices => ready(&self.managed),
-            View::Mailboxes => ready(&self.mailboxes),
+            // The union, not the report — that is what the view lists.
+            View::Mailboxes => match &self.mailboxes {
+                Some(Fetch::Ready(_)) => Some(self.mailbox_rows.len()),
+                _ => None,
+            },
             View::Teams => ready(&self.teams),
             View::SignIns => ready(&self.sign_ins),
             View::AuditLogs => ready(&self.audits),
@@ -328,6 +342,90 @@ impl Store {
             View::AdComputers => reason(&self.ad_computers),
             _ => None,
         }
+    }
+
+    /// Store the usage report *and* rebuild the list the view shows.
+    ///
+    /// Paired for the same reason [`Self::set_ad_users`] is: the view's row
+    /// indices point into `mailbox_rows`, so assigning the report without
+    /// rebuilding would leave the selection pointing at a different mailbox
+    /// than the one under the cursor.
+    fn set_mailboxes(&mut self, fetch: Fetch<Arc<Vec<Mailbox>>>) {
+        self.mailboxes = Some(fetch);
+        self.rebuild_mailbox_rows();
+    }
+
+    /// Store the user list *and* rebuild the mailbox list that draws on it.
+    ///
+    /// Only the authoritative list from Graph comes through here. The
+    /// optimistic in-place edits elsewhere — a job title, an enable/disable —
+    /// cannot change whether an account has a mailbox, and the one that could,
+    /// a licence change, is followed by a reload of the whole collection.
+    fn set_users(&mut self, users: Arc<Vec<User>>) {
+        self.users = users;
+        self.rebuild_mailbox_rows();
+    }
+
+    /// Union the usage report with the accounts that hold a live Exchange plan.
+    ///
+    /// Neither source is sufficient alone and they miss different things, which
+    /// is why this unions rather than choosing. The report is a day stale but
+    /// carries every number the view shows and covers the shared, room and
+    /// equipment mailboxes that hold no licence. `/users` carries no numbers at
+    /// all but is live, so a mailbox made this morning appears today instead of
+    /// tomorrow.
+    ///
+    /// Rows the report supplied always win: a mailbox in both is the reported
+    /// one, numbers and all.
+    fn rebuild_mailbox_rows(&mut self) {
+        // Only when the report actually arrived. A tenant with no Exchange, or
+        // an app registration without Reports.Read.All, gets the explanation
+        // the view already gives — a partial list with every figure blank would
+        // be a worse answer than a clear account of why there is no list.
+        let Some(Fetch::Ready(reported)) = &self.mailboxes else {
+            self.mailbox_rows = Arc::new(Vec::new());
+            return;
+        };
+
+        let mut rows: Vec<Mailbox> = reported.as_ref().clone();
+
+        // A tenant that conceals report identities returns opaque GUIDs where
+        // the UPN should be, so there is no key to join on. Joining anyway
+        // would match nothing and append a duplicate of every mailbox under its
+        // real name — worse than not joining at all.
+        let concealed = rows.iter().any(Mailbox::is_concealed);
+        if !concealed {
+            let reported_upns: HashSet<String> = rows
+                .iter()
+                .map(|mailbox| mailbox.user_principal_name.to_lowercase())
+                .collect();
+
+            for user in self.users.iter() {
+                let Some(upn) = user.user_principal_name.as_deref() else {
+                    continue;
+                };
+                // Case folded on both sides, like the sAMAccountName join:
+                // Entra echoes back whatever case the UPN was created with, and
+                // the report has its own ideas.
+                if !user.has_mailbox() || reported_upns.contains(&upn.to_lowercase()) {
+                    continue;
+                }
+                rows.push(Mailbox::from_directory(user));
+            }
+        }
+
+        // Fullest first, as before — the mailbox about to stop receiving mail
+        // is what this view exists to surface. Rows with no figures yet sort
+        // below every reported one rather than among the empty mailboxes, where
+        // a nil usage bar would put them.
+        rows.sort_by(|a, b| {
+            b.metrics_known()
+                .cmp(&a.metrics_known())
+                .then_with(|| b.usage_fraction().total_cmp(&a.usage_fraction()))
+                .then_with(|| a.name().to_lowercase().cmp(&b.name().to_lowercase()))
+        });
+
+        self.mailbox_rows = Arc::new(rows);
     }
 
     /// Store the AD user list *and* rebuild the index that joins it to Entra.
@@ -1201,7 +1299,7 @@ impl App {
                 self.store.org = Some(*org);
             }
             Event::Users(users) => {
-                self.store.users = users;
+                self.store.set_users(users);
                 self.finish(Collection::Users);
             }
             Event::Groups(groups) => {
@@ -1274,7 +1372,7 @@ impl App {
                 }
             }
             Event::Mailboxes(fetch) => {
-                self.store.mailboxes = Some(fetch);
+                self.store.set_mailboxes(fetch);
                 self.finish(Collection::Mailboxes);
             }
             Event::TeamDetail {
@@ -1661,10 +1759,7 @@ impl App {
 
     fn selected_mailbox(&self) -> Option<&Mailbox> {
         let state = self.views.get(&View::Mailboxes)?;
-        match &self.store.mailboxes {
-            Some(Fetch::Ready(mailboxes)) => mailboxes.get(state.selected_source()?),
-            _ => None,
-        }
+        self.store.mailbox_rows.get(state.selected_source()?)
     }
 
     /// The identifier the mailbox settings cache is keyed by for a mailbox.
@@ -1718,7 +1813,7 @@ impl App {
                     .refresh(version, len, |i, needle| list::sku_matches(&data[i], needle));
             }
             View::Mailboxes => {
-                let data = Store::optional(&self.store.mailboxes);
+                let data = self.store.mailbox_rows.clone();
                 let len = data.len();
                 self.view_state(view).refresh(version, len, |i, needle| {
                     list::mailbox_matches(&data[i], needle)
@@ -3030,6 +3125,173 @@ mod tests {
             matched > 0,
             "no demo user joined to an AD object — the two fixtures disagree about \
              sAMAccountName"
+        );
+    }
+
+    // ---- The mailbox union -------------------------------------------------
+
+    fn reported(upn: &str, storage: i64) -> Mailbox {
+        Mailbox {
+            user_principal_name: upn.into(),
+            display_name: upn.split('@').next().unwrap_or(upn).into(),
+            storage_used: storage,
+            prohibit_send_receive_quota: 100,
+            source: MailboxSource::Report,
+            ..Default::default()
+        }
+    }
+
+    fn mailbox_user(upn: &str, has_mailbox: bool) -> User {
+        User {
+            id: format!("id-{upn}"),
+            display_name: Some(upn.split('@').next().unwrap_or(upn).into()),
+            user_principal_name: Some(upn.into()),
+            assigned_plans: if has_mailbox {
+                vec![AssignedPlan {
+                    service: Some("exchange".into()),
+                    capability_status: Some("Enabled".into()),
+                    ..Default::default()
+                }]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        }
+    }
+
+    fn union_of(report: Vec<Mailbox>, users: Vec<User>) -> Arc<Vec<Mailbox>> {
+        let mut store = Store::default();
+        store.set_users(Arc::new(users));
+        store.set_mailboxes(Fetch::Ready(Arc::new(report)));
+        store.mailbox_rows.clone()
+    }
+
+    #[test]
+    fn a_mailbox_the_report_has_not_reached_still_appears() {
+        // The whole point. The report is compiled daily, so a mailbox created
+        // this morning is in the directory and nowhere else.
+        let rows = union_of(
+            vec![reported("aisha@contoso.co.uk", 50)],
+            vec![
+                mailbox_user("aisha@contoso.co.uk", true),
+                mailbox_user("new.starter@contoso.co.uk", true),
+            ],
+        );
+
+        assert_eq!(rows.len(), 2);
+        let new = rows
+            .iter()
+            .find(|mailbox| mailbox.upn() == "new.starter@contoso.co.uk")
+            .expect("the new mailbox must be listed");
+        assert!(!new.metrics_known(), "it has no figures yet");
+        assert_eq!(new.storage_display(), "Not yet reported");
+        assert_eq!(new.item_count_display(), "—");
+    }
+
+    #[test]
+    fn an_account_without_an_exchange_plan_is_not_a_mailbox() {
+        let rows = union_of(
+            vec![],
+            vec![
+                mailbox_user("no.mailbox@contoso.co.uk", false),
+                mailbox_user("has.one@contoso.co.uk", true),
+            ],
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].upn(), "has.one@contoso.co.uk");
+    }
+
+    #[test]
+    fn the_report_wins_where_both_sources_know_the_mailbox() {
+        // Otherwise every licensed mailbox would appear twice, once with
+        // figures and once without.
+        let rows = union_of(
+            vec![reported("aisha@contoso.co.uk", 50)],
+            vec![mailbox_user("aisha@contoso.co.uk", true)],
+        );
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].metrics_known(), "the reported row must survive");
+        assert_eq!(rows[0].storage_used, 50);
+    }
+
+    #[test]
+    fn the_join_folds_case_on_both_sides_of_the_upn() {
+        // Entra echoes back whatever case the UPN was created with; the report
+        // has its own ideas. Matching literally would double every mailbox
+        // whose case differs between the two.
+        let rows = union_of(
+            vec![reported("Aisha.Rahman@Contoso.co.uk", 50)],
+            vec![mailbox_user("aisha.rahman@contoso.co.uk", true)],
+        );
+        assert_eq!(rows.len(), 1, "got {rows:#?}");
+    }
+
+    #[test]
+    fn unreported_mailboxes_sort_below_every_reported_one() {
+        // A row with no figures must not land among the empty mailboxes, where
+        // a nil usage fraction would otherwise put it.
+        let rows = union_of(
+            vec![
+                reported("full@contoso.co.uk", 99),
+                reported("empty@contoso.co.uk", 0),
+            ],
+            vec![mailbox_user("brand.new@contoso.co.uk", true)],
+        );
+
+        let names: Vec<&str> = rows.iter().map(Mailbox::upn).collect();
+        assert_eq!(
+            names,
+            ["full@contoso.co.uk", "empty@contoso.co.uk", "brand.new@contoso.co.uk"]
+        );
+    }
+
+    #[test]
+    fn a_concealed_report_is_left_alone_rather_than_joined() {
+        // With report identities anonymised there is no key to match on, so a
+        // join would match nothing and append every mailbox a second time
+        // under its real name.
+        let mut concealed = reported("a1b2c3d4-0000-0000-0000-000000000000", 50);
+        concealed.display_name = "A1B2C3D4".into();
+        assert!(concealed.is_concealed());
+
+        let rows = union_of(
+            vec![concealed],
+            vec![mailbox_user("aisha@contoso.co.uk", true)],
+        );
+        assert_eq!(rows.len(), 1, "the directory half must be skipped entirely");
+    }
+
+    #[test]
+    fn no_report_means_no_list_rather_than_a_list_without_figures() {
+        // A tenant with no Exchange, or an app registration without
+        // Reports.Read.All, gets the view's own explanation. Half a list with
+        // every column blank would be a worse answer than a clear one.
+        let mut store = Store::default();
+        store.set_users(Arc::new(vec![mailbox_user("aisha@contoso.co.uk", true)]));
+        store.set_mailboxes(Fetch::Unavailable("no Exchange here".into()));
+
+        assert!(store.mailbox_rows.is_empty());
+        assert_eq!(store.count(View::Mailboxes), None);
+    }
+
+    #[test]
+    fn the_demo_fixtures_exercise_both_halves_of_the_union() {
+        let mut store = Store::default();
+        store.set_users(crate::demo::users());
+        store.set_mailboxes(crate::demo::mailboxes());
+
+        let reported = store
+            .mailbox_rows
+            .iter()
+            .filter(|mailbox| mailbox.metrics_known())
+            .count();
+        let from_directory = store.mailbox_rows.len() - reported;
+
+        assert!(reported > 0, "the demo must show reported mailboxes");
+        assert!(
+            from_directory > 0,
+            "the demo must also show a mailbox the report has not reached, or the \
+             union is never visible while developing"
         );
     }
 

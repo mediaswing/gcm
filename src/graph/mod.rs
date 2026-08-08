@@ -310,7 +310,8 @@ impl GraphClient {
         let select = "id,displayName,userPrincipalName,mail,jobTitle,department,\
                       officeLocation,mobilePhone,businessPhones,accountEnabled,userType,\
                       createdDateTime,lastPasswordChangeDateTime,onPremisesSyncEnabled,\
-                      onPremisesSamAccountName,usageLocation,assignedLicenses,proxyAddresses";
+                      onPremisesSamAccountName,usageLocation,assignedLicenses,proxyAddresses,\
+                      assignedPlans";
         let mut users: Vec<User> = self
             .get_all(&format!(
                 "/users?$select={select}&$top={}",

@@ -50,7 +50,7 @@ rights standing in for everybody.
 | **Entra Devices** | Registered and joined devices, with join type (Entra joined, hybrid joined, Entra registered), compliance, and last sign-in. |
 | **Managed Devices** | Intune enrolments: compliance state, management agent, ownership, hardware, encryption and supervision, storage and last check-in. Degrades to a clear explanation when the tenant has no Intune — see below. |
 | **Licenses** | Every subscribed SKU with a friendly product name, seats purchased, assigned and available, a usage bar, and the service plans inside each SKU. Over-assignment is called out rather than shown as a negative number. |
-| **Exchange** | Every mailbox with size against quota, item count and last activity, fullest first. Details add all three quota thresholds, archive state, deleted-item volume, and the mailbox's time zone, language and automatic replies. |
+| **Exchange** | Every mailbox with size against quota, item count and last activity, fullest first. Mailboxes newer than the daily usage report are listed too, from the directory, marked as not yet reported. Details add all three quota thresholds, archive state, deleted-item volume, and the mailbox's time zone, language and automatic replies. |
 | **Teams** | Every team with visibility and archived state. Details add channels with their addresses, what members and guests are allowed to do, messaging and Giphy settings, and a link straight into the Teams client. |
 | **Sign-in Logs** | Recent sign-ins with the user, application, outcome, risk state and location. Details add the failure code and reason, the device and its compliance, Conditional Access outcome, and the correlation ID to quote at Microsoft support. |
 | **Audit Logs** | Recent directory changes: what happened, in which category, who did it, to what, and whether it worked — with the before-and-after values of each modified property. |
@@ -59,6 +59,8 @@ rights standing in for everybody.
 
 ### Where the mailbox list comes from
 
+Two places, because neither is sufficient alone.
+
 Graph has no collection that lists mailboxes; `/users` knows about accounts, not
 about the mailboxes behind them. The Exchange view therefore reads the
 `getMailboxUsageDetail` report, which is the only v1.0 endpoint that enumerates
@@ -66,10 +68,31 @@ them — and which happens to carry exactly the numbers somebody opens Exchange 
 check. It arrives as CSV rather than JSON, addressed by column name rather than
 position, because Microsoft has changed the column set before.
 
-Two consequences worth knowing. The report is compiled daily, so a mailbox
-created this morning will not appear until tomorrow. And a tenant with *Reports
-→ Display concealed user information* switched on returns anonymised
-identifiers instead of names; gcm says so in the details pane rather than
+That report is compiled once a day, which used to mean a mailbox created this
+morning was simply missing. So accounts holding an **enabled Exchange service
+plan** are folded in from `/users` as well — a live signal, and one that costs
+nothing, since the Users collection is already loaded. A mailbox created minutes
+ago therefore appears straight away, marked **Not yet reported** where its size,
+quota and activity would be.
+
+The two halves miss different things, which is why the view unions them rather
+than choosing:
+
+| | Covers | Misses |
+| --- | --- | --- |
+| **The usage report** | Every number the view shows; shared, room and equipment mailboxes, which hold no licence | Anything created since it was last compiled |
+| **`/users`** | Mailboxes created since then | Every figure — Graph exposes no mailbox size or quota at all; unlicensed mailboxes |
+
+Rows the report supplied always win, so a mailbox known to both is the reported
+one, numbers and all. Unreported rows sort below every reported one — the view
+orders by fullness, and a row with no figures is not an empty mailbox.
+
+Two more consequences worth knowing. **The figures stay up to a day stale**;
+this fixes "where is the mailbox I just made?", not "is this mailbox full right
+now". And a tenant with *Reports → Display concealed user information* switched
+on returns anonymised identifiers instead of names — there is then no UPN to
+join on, so the union is skipped entirely rather than appending every mailbox a
+second time under its real name. gcm says so in the details pane rather than
 leaving you to wonder why every mailbox looks like a serial number.
 
 ### What Graph cannot do to Exchange
@@ -128,7 +151,7 @@ In the Entra admin centre, under **App registrations → New registration**:
    | `Team.ReadBasic.All` | The list of teams |
    | `TeamSettings.Read.All` | An individual team's settings and archived state |
    | `Channel.ReadBasic.All` | A team's channels |
-   | `Reports.Read.All` | The mailbox list, via the usage report |
+   | `Reports.Read.All` | Mailbox sizes, quotas and activity, via the usage report |
    | `MailboxSettings.Read` | Automatic replies and mailbox preferences |
 
    Anything you leave out simply shows as unavailable in that view; gcm still
@@ -952,8 +975,10 @@ cover still renders instead of becoming a tofu box.
 - Exchange administration is limited to what Graph exposes: mailbox size, quota,
   activity and automatic replies. Permissions, forwarding, litigation hold and
   transport rules are Exchange Online PowerShell only.
-- The mailbox list comes from a report compiled daily, so a mailbox created this
-  morning appears tomorrow.
+- Mailbox size, quota and activity come from a report compiled daily, so those
+  figures can be up to a day stale. The *list* is live — a mailbox created this
+  morning appears at once, marked as not yet reported — because Graph exposes
+  no mailbox size or quota at any freshness.
 - Automatic replies can be switched on and off but not *scheduled*. A schedule
   needs a start and end instant in the mailbox's own time zone, and a console
   that got that subtly wrong would stop answering somebody's mail on the wrong
