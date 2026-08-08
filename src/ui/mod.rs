@@ -3274,6 +3274,11 @@ mod tests {
         assert_eq!(store.count(View::Mailboxes), None);
     }
 
+    /// The demo module is compiled out of a release build, so this test has to
+    /// be too — `cargo test --release` is what the release workflow runs, and
+    /// an ungated reference to `crate::demo` fails to compile there rather than
+    /// merely failing to run.
+    #[cfg(debug_assertions)]
     #[test]
     fn the_demo_fixtures_exercise_both_halves_of_the_union() {
         let mut store = Store::default();
