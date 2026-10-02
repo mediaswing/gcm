@@ -27,9 +27,12 @@ registration's *application* permissions allow, and nothing more.
 3. Under **Certificates & secrets → Client secrets**, add a secret and copy
    its **Value**. You copy the Value, not the Secret ID, and it is shown only
    once.
-4. Under **API permissions → Add a permission → Microsoft Graph →
-   Application permissions**, add the permissions below. Then press **Grant
-   admin consent**.
+4. Grant the permissions below. The easiest way is from the app: enter the
+   tenant and client IDs on the **Connection** tab and press **Grant
+   permissions…** (see [Granting permissions from the
+   app](#granting-permissions-from-the-app)). Or, in the portal, go to **API
+   permissions → Add a permission → Microsoft Graph → Application
+   permissions**, add them, and press **Grant admin consent**.
 
 | Permission | Used for |
 | --- | --- |
@@ -60,6 +63,34 @@ Two limits come from Entra itself, not from this app. An app with
 holds an admin role, unless the app has been given a suitable directory role
 too. And users synchronised from on-premises Active Directory have to be
 changed there.
+
+### Granting permissions from the app
+
+An app can't give itself permissions using its own secret. Only an
+administrator can grant them. So **Grant permissions…** on the
+**Connection** tab borrows one, once:
+
+1. Your browser opens Microsoft's sign-in page. Sign in as a **Global
+   Administrator** or **Privileged Role Administrator**. Granting
+   application permissions on Microsoft Graph is limited to those two
+   roles.
+2. The app adds any missing permissions from the table above to the app
+   registration's **API permissions** list, then grants admin consent for
+   them.
+3. It signs in again with the client secret, so the **Connection** tab shows
+   the new permissions straight away.
+
+The administrator's sign-in is used for this alone. It is held in memory
+only, and never saved.
+
+This sign-in uses **Microsoft Graph Command Line Tools**, Microsoft's own
+app for working with Graph interactively (the one behind `Connect-MgGraph`).
+Because of that, your app registration needs no redirect URI or other
+changes. The first time, Microsoft may ask the administrator to consent to
+that tool reading and writing app registrations and role assignments. The
+flow is an OAuth authorisation code flow with PKCE. Microsoft sends the
+browser back to a listener the app opens on `localhost` for that one
+sign-in, which accepts connections only from the same computer.
 
 ### Where things are kept
 
@@ -191,8 +222,35 @@ does not.
 
 **Export** copies the directory into a MariaDB or MySQL server; see below.
 
-**Settings** chooses light, dark, or following the system, and turns the
-debug log on or off.
+**Settings** chooses light, dark, or following the system, turns update
+checks and the debug log on or off, and has a **Check now** button for
+updates.
+
+## Updates
+
+When the app starts, it asks GitHub whether there's a newer release of
+[mediaswing/gcm](https://github.com/mediaswing/gcm/releases). You can turn
+this off under **Settings**. If there is one, a banner across the top of
+the window offers it. **Install and restart** does the following:
+
+1. Downloads the package for your platform from the release.
+2. Checks it against the SHA-256 checksum GitHub publishes for that file. If
+   they don't match, nothing is installed.
+3. Replaces this copy of the app. On macOS that's the `.app` you're running
+   it from. On Windows it's `gcm.exe`. On Ubuntu it installs the `.deb` with
+   `apt-get` through `pkexec`, which asks for an administrator's password.
+4. Starts the new version and closes the old one.
+
+**Skip this version** stops a release being offered again. A newer one is
+still offered.
+
+On macOS, the app has to be somewhere you can write to, such as
+**Applications**. The update arrives without macOS's quarantine flag, so
+unlike the first download it opens without the **Open Anyway** step.
+
+A copy that wasn't installed from a release package can't replace itself.
+That includes one started with `cargo run`, or a binary copied out of the
+`.deb`. For those, the banner links to the release page instead.
 
 ## The debug log
 

@@ -11,6 +11,7 @@
 //! hands a clone to a [`crate::task::Task`]. The token is cached and fetched
 //! again a few minutes before it expires.
 
+pub mod consent;
 pub mod devices;
 pub mod groups;
 pub mod licensing;
@@ -27,7 +28,7 @@ use serde_json::Value;
 use ureq::Agent;
 
 pub const GRAPH: &str = "https://graph.microsoft.com/v1.0";
-const LOGIN: &str = "https://login.microsoftonline.com";
+pub(crate) const LOGIN: &str = "https://login.microsoftonline.com";
 const TIMEOUT: Duration = Duration::from_secs(60);
 /// Fetch a new token this long before the old one runs out, so a request is
 /// never sent with one that expires on the way.
@@ -86,6 +87,9 @@ struct Inner {
     agent: Agent,
     credentials: Credentials,
     token: Mutex<Option<Token>>,
+    /// A token obtained some other way, used as it is: the admin's own,
+    /// from the one-off sign-in in [`consent`]. Never refreshed.
+    fixed_bearer: Option<String>,
 }
 
 #[derive(Clone)]
@@ -126,20 +130,28 @@ pub type Result<T> = std::result::Result<T, String>;
 
 impl Graph {
     pub fn new(credentials: Credentials) -> Self {
-        // Graph's error bodies carry the only useful explanation of what went
-        // wrong, so a 4xx is read like any other response rather than turned
-        // into a bare status code.
-        let agent: Agent = Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(TIMEOUT))
-            .user_agent(concat!("gcm/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .into();
+        Self::build(credentials, None)
+    }
+
+    /// A client that sends a token it was given, rather than signing in.
+    fn with_bearer(tenant_id: &str, bearer: String) -> Self {
+        Self::build(
+            Credentials {
+                tenant_id: tenant_id.to_owned(),
+                client_id: String::new(),
+                client_secret: String::new(),
+            },
+            Some(bearer),
+        )
+    }
+
+    fn build(credentials: Credentials, fixed_bearer: Option<String>) -> Self {
         Self {
             inner: Arc::new(Inner {
-                agent,
+                agent: agent(),
                 credentials,
                 token: Mutex::new(None),
+                fixed_bearer,
             }),
         }
     }
@@ -185,6 +197,9 @@ impl Graph {
 
     /// A valid access token, from the cache or freshly fetched.
     fn bearer(&self) -> Result<String> {
+        if let Some(bearer) = &self.inner.fixed_bearer {
+            return Ok(bearer.clone());
+        }
         let mut slot = self.inner.token.lock().map_err(|_| "token cache poisoned")?;
         if let Some(token) = slot.as_ref()
             && token.expires > Instant::now() + TOKEN_MARGIN
@@ -200,15 +215,7 @@ impl Graph {
             return Err("Enter the client secret first.".to_owned());
         }
 
-        // The tenant becomes part of the sign-in URL, so a `/`, `?` or `#`
-        // typed into the box would point the secret at a different endpoint.
-        let tenant = c.tenant_id.trim();
-        if !tenant
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '.'))
-        {
-            return Err("The tenant ID is a GUID or a domain such as contoso.onmicrosoft.com.".to_owned());
-        }
+        let tenant = checked_tenant(&c.tenant_id)?;
         let url = format!("{LOGIN}/{tenant}/oauth2/v2.0/token");
         log::debug!(
             "requesting a token for tenant {tenant}, client {}",
@@ -505,6 +512,33 @@ impl Graph {
     }
 }
 
+/// The HTTP client every request goes through. Graph's error bodies carry the
+/// only useful explanation of what went wrong, so a 4xx is read like any
+/// other response rather than turned into a bare status code.
+pub(crate) fn agent() -> Agent {
+    Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(TIMEOUT))
+        .user_agent(concat!("gcm/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .into()
+}
+
+/// The tenant as typed, trimmed, once it is known to be safe to put in a
+/// sign-in URL: a `/`, `?` or `#` typed into the box would otherwise point
+/// the request at a different endpoint.
+pub(crate) fn checked_tenant(tenant: &str) -> Result<&str> {
+    let tenant = tenant.trim();
+    if tenant.is_empty()
+        || !tenant
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '.'))
+    {
+        return Err("The tenant ID is a GUID or a domain such as contoso.onmicrosoft.com.".to_owned());
+    }
+    Ok(tenant)
+}
+
 /// How one try at a request went, short of failing to reach Graph at all.
 enum Attempt {
     Done(Option<Value>),
@@ -530,7 +564,7 @@ fn retry_wait(method: &str, status: u16, attempt: u32, retry_after: Option<Durat
 /// Microsoft appends the trace and correlation IDs and a timestamp, on new
 /// lines or, lately, on the same one; they are in the log, and in the status
 /// bar they only push the explanation out of sight.
-fn aadsts_summary(description: &str) -> &str {
+pub(crate) fn aadsts_summary(description: &str) -> &str {
     let first = description.lines().next().unwrap_or(description);
     first
         .split(" Trace ID:")
@@ -541,7 +575,7 @@ fn aadsts_summary(description: &str) -> &str {
 
 /// The ID Microsoft gives each request, which its support asks for. Graph
 /// calls the header `request-id`; the sign-in endpoint, `x-ms-request-id`.
-fn request_id(response: &ureq::http::Response<ureq::Body>) -> String {
+pub(crate) fn request_id(response: &ureq::http::Response<ureq::Body>) -> String {
     let headers = response.headers();
     ["request-id", "x-ms-request-id"]
         .iter()

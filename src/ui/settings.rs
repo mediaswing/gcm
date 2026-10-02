@@ -1,4 +1,5 @@
-//! The Settings pane: light, dark, or follow the system, and the debug log.
+//! The Settings pane: light, dark, or follow the system, updates, and the
+//! debug log.
 
 use egui::{RichText, Ui};
 
@@ -7,7 +8,7 @@ use crate::config::Appearance;
 use crate::ui;
 
 pub fn show(app: &mut App, ui: &mut Ui) {
-    ui::pane_header(ui, "Settings", "How the app looks, and a log for when something goes wrong.");
+    ui::pane_header(ui, "Settings", "How the app looks, updates, and a log for when something goes wrong.");
 
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.set_max_width(640.0);
@@ -75,6 +76,35 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 app.report_ok("Log file location copied.");
             }
         });
+
+        ui.add_space(16.0);
+        ui.label(RichText::new("Updates").strong());
+        ui.add_space(6.0);
+        if ui
+            .checkbox(&mut app.config.check_for_updates, "Check for updates when the app starts")
+            .changed()
+        {
+            changed = true;
+        }
+        ui.label(
+            RichText::new(
+                "Asks GitHub for the latest release of mediaswing/gcm. When there is a newer one, a banner offers to download it, check it against GitHub's published checksum, install it and restart.",
+            )
+            .size(12.0)
+            .weak(),
+        );
+        ui.add_space(4.0);
+        let checking = app.update.checking();
+        if ui
+            .add_enabled(
+                !checking,
+                egui::Button::new(if checking { "Checking…" } else { "Check now" }),
+            )
+            .clicked()
+        {
+            let ctx = ui.ctx().clone();
+            crate::ui::update::check(app, &ctx, true);
+        }
 
         if changed && let Err(err) = app.config.save() {
             app.report_error(format!("The setting could not be saved: {err}"));

@@ -67,6 +67,7 @@ pub struct App {
     pub licensing: ui::licensing::State,
     pub logs: ui::logs::State,
     pub export: ui::export::State,
+    pub update: ui::update::State,
 }
 
 impl App {
@@ -96,11 +97,15 @@ impl App {
             licensing: ui::licensing::State::default(),
             logs: ui::logs::State::default(),
             export: ui::export::State::from_config(&config),
+            update: ui::update::State::default(),
             config,
         };
         // A remembered secret means the user asked to be signed in without
         // being asked again, so do that now, in the background.
         ui::connection::sign_in_at_start(&mut app, &cc.egui_ctx);
+        if app.config.check_for_updates {
+            ui::update::check(&mut app, &cc.egui_ctx, false);
+        }
         app
     }
 
@@ -145,6 +150,7 @@ impl App {
             .or_else(|| self.licensing.activity())
             .or_else(|| self.logs.activity())
             .or_else(|| self.export.activity())
+            .or_else(|| self.update.activity())
     }
 
     fn tab_strip(&mut self, ui: &mut egui::Ui) {
@@ -212,7 +218,8 @@ impl eframe::App for App {
 
         // Answers are collected whichever tab is showing, so a load started on
         // one tab is not lost by moving to another.
-        ui::connection::poll(self);
+        ui::connection::poll(self, &ctx);
+        ui::update::poll(self, &ctx);
         ui::users::poll(self);
         ui::groups::poll(self);
         ui::devices::poll(self);
@@ -227,15 +234,18 @@ impl eframe::App for App {
 
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
 
-        egui::CentralPanel::default().show(ui, |ui| match self.tab {
-            Tab::Connection => ui::connection::show(self, ui),
-            Tab::Users => ui::users::show(self, ui),
-            Tab::Groups => ui::groups::show(self, ui),
-            Tab::Devices => ui::devices::show(self, ui),
-            Tab::Licensing => ui::licensing::show(self, ui),
-            Tab::Logs => ui::logs::show(self, ui),
-            Tab::Export => ui::export::show(self, ui),
-            Tab::Settings => ui::settings::show(self, ui),
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui::update::banner(self, ui);
+            match self.tab {
+                Tab::Connection => ui::connection::show(self, ui),
+                Tab::Users => ui::users::show(self, ui),
+                Tab::Groups => ui::groups::show(self, ui),
+                Tab::Devices => ui::devices::show(self, ui),
+                Tab::Licensing => ui::licensing::show(self, ui),
+                Tab::Logs => ui::logs::show(self, ui),
+                Tab::Export => ui::export::show(self, ui),
+                Tab::Settings => ui::settings::show(self, ui),
+            }
         });
 
         // Modals are drawn last, over everything.

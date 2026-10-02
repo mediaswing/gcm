@@ -1,9 +1,16 @@
 //! The Connection pane: which tenant, which app registration, and the secret
 //! to sign in with. App-only sign-in — no browser, no device code.
+//!
+//! The one exception is granting the registration its permissions, which
+//! only an administrator can do: see [`crate::graph::consent`].
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use egui::{RichText, Ui};
 
 use crate::app::{App, Tab};
+use crate::graph::consent::{AdminSignIn, Report};
 use crate::graph::{Credentials, Graph, REQUIRED_ROLES, Session};
 use crate::secrets;
 use crate::task::{Task, take_finished};
@@ -16,6 +23,13 @@ pub struct State {
     pub remember_secret: bool,
     pub error: Option<String>,
     signing_in: Option<Task<(Graph, Session)>>,
+    /// The admin sign-in that grants permissions, while it is waiting for
+    /// the browser or granting.
+    granting: Option<Task<Report>>,
+    /// The page the admin sign-in opened, in case the browser did not.
+    grant_url: Option<String>,
+    grant_cancel: Option<Arc<AtomicBool>>,
+    grant_error: Option<String>,
 }
 
 impl State {
@@ -39,11 +53,18 @@ impl State {
             client_secret,
             error: None,
             signing_in: None,
+            granting: None,
+            grant_url: None,
+            grant_cancel: None,
+            grant_error: None,
         }
     }
 
     pub fn activity(&self) -> Option<String> {
-        self.signing_in.as_ref().map(|t| t.label.clone())
+        self.signing_in
+            .as_ref()
+            .map(|t| t.label.clone())
+            .or_else(|| self.granting.as_ref().map(|t| t.label.clone()))
     }
 }
 
@@ -75,7 +96,64 @@ fn start(app: &mut App, ctx: &egui::Context) {
     }));
 }
 
-pub fn poll(app: &mut App) {
+/// Open the browser for an administrator to sign in and grant the
+/// registration its permissions.
+fn start_grant(app: &mut App, ctx: &egui::Context) {
+    if app.connection.granting.is_some() {
+        return;
+    }
+    let sign_in = match AdminSignIn::prepare(&app.connection.tenant_id, &app.connection.client_id) {
+        Ok(sign_in) => sign_in,
+        Err(err) => {
+            app.connection.grant_error = Some(err.clone());
+            app.report_error(err);
+            return;
+        }
+    };
+    let url = sign_in.url().to_owned();
+    log::info!("opening the browser for an admin sign-in to grant permissions");
+    ctx.open_url(egui::OpenUrl::new_tab(&url));
+    app.connection.grant_url = Some(url);
+    app.connection.grant_cancel = Some(sign_in.cancel_flag());
+    app.connection.grant_error = None;
+    app.connection.granting = Some(Task::spawn(ctx, "Waiting for the administrator to sign in…", move || {
+        sign_in.finish()
+    }));
+}
+
+fn finish_grant(app: &mut App, ctx: &egui::Context, result: Result<Report, String>) {
+    app.connection.grant_url = None;
+    app.connection.grant_cancel = None;
+    match result {
+        Ok(report) => {
+            let mut message = match report.granted.len() {
+                0 => "Every permission was already granted.".to_owned(),
+                1 => "Granted 1 permission.".to_owned(),
+                n => format!("Granted {n} permissions."),
+            };
+            if !report.warnings.is_empty() {
+                message.push(' ');
+                message.push_str(&report.warnings.join(" "));
+                app.connection.grant_error = Some(report.warnings.join("\n"));
+            }
+            app.report_ok(message);
+            // A token carries the roles it was issued with, so sign in again
+            // to pick up the new ones.
+            if !app.connection.client_secret.is_empty() {
+                start(app, ctx);
+            }
+        }
+        Err(err) => {
+            app.connection.grant_error = Some(err.clone());
+            app.report_error(err);
+        }
+    }
+}
+
+pub fn poll(app: &mut App, ctx: &egui::Context) {
+    if let Some(result) = take_finished(&mut app.connection.granting) {
+        finish_grant(app, ctx, result);
+    }
     let Some(result) = take_finished(&mut app.connection.signing_in) else {
         return;
     };
@@ -206,12 +284,14 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             ui::error_text(ui, error);
         }
 
+        grant_section(app, ui, &ctx);
+
         if let Some(session) = &app.session {
             ui.add_space(18.0);
             ui.heading("Permissions");
             ui.label(
                 RichText::new(
-                    "The application permissions this sign-in carries. Anything missing is granted under API permissions > Microsoft Graph > Application permissions, followed by Grant admin consent.",
+                    "The application permissions this sign-in carries. Anything missing can be granted with Grant permissions above, or in the portal under API permissions.",
                 )
                 .size(13.0)
                 .weak(),
@@ -258,7 +338,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 "1. In the Entra admin centre, go to App registrations > New registration. No redirect URI is needed.",
                 "2. Copy the Application (client) ID and Directory (tenant) ID from its Overview page.",
                 "3. Under Certificates & secrets, add a client secret and copy its Value.",
-                "4. Under API permissions, add the Microsoft Graph application permissions listed in the README, then Grant admin consent.",
+                "4. Press Grant permissions above and sign in as an administrator, or add the permissions listed in the README under API permissions and Grant admin consent.",
             ] {
                 ui.label(RichText::new(line).size(13.0));
             }
@@ -275,4 +355,70 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             .weak(),
         );
     });
+}
+
+/// "Grant permissions…": offered once there is a tenant and client to grant
+/// them to, while any are missing or before the first sign-in has said.
+fn grant_section(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
+    let s = &app.connection;
+    let ids_entered = !s.tenant_id.trim().is_empty() && !s.client_id.trim().is_empty();
+    let missing = app.session.as_ref().map(|session| {
+        REQUIRED_ROLES
+            .iter()
+            .filter(|(role, _)| !session.roles.iter().any(|r| r == role))
+            .count()
+    });
+    let granting = s.granting.is_some();
+    if !ids_entered || (missing == Some(0) && !granting && s.grant_error.is_none()) {
+        return;
+    }
+
+    ui.add_space(18.0);
+    ui.heading("Grant permissions");
+    let lead = match missing {
+        Some(n) => format!("This app registration is missing {n} of the permissions the app uses."),
+        None => "Give this app registration the permissions the app uses.".to_owned(),
+    };
+    ui.label(
+        RichText::new(format!(
+            "{lead} An administrator signs in once in the browser, and the app adds the permissions to the registration and grants admin consent. The administrator's sign-in is used for this alone and is not kept."
+        ))
+        .size(13.0),
+    );
+    ui.label(
+        RichText::new(
+            "Needs a Global Administrator or Privileged Role Administrator. The sign-in is through Microsoft Graph Command Line Tools, Microsoft's own app for working with Graph, which may ask for consent the first time.",
+        )
+        .size(12.0)
+        .weak(),
+    );
+    ui.add_space(6.0);
+
+    if granting {
+        ui::busy(ui, "Waiting for the sign-in in your browser…");
+        ui.horizontal(|ui| {
+            if let Some(url) = app.connection.grant_url.clone()
+                && ui.link("Open the sign-in page again").clicked()
+            {
+                ctx.open_url(egui::OpenUrl::new_tab(url));
+            }
+            if ui.button("Cancel").clicked()
+                && let Some(cancel) = &app.connection.grant_cancel
+            {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        });
+    } else if ui
+        .add_enabled_ui(app.connection.signing_in.is_none(), |ui| {
+            ui::wide_button(ui, "Grant permissions…")
+        })
+        .inner
+        .clicked()
+    {
+        start_grant(app, ctx);
+    }
+    if let Some(err) = &app.connection.grant_error {
+        ui.add_space(4.0);
+        ui::error_text(ui, err);
+    }
 }

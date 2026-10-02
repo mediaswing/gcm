@@ -41,7 +41,7 @@ impl Appearance {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub appearance: Appearance,
@@ -52,6 +52,25 @@ pub struct Config {
     pub mariadb: MariaDbSettings,
     /// Write a detailed log to `gcm-debug.log`; see [`crate::logging`].
     pub debug_logging: bool,
+    /// Ask GitHub at startup whether there is a newer release; see
+    /// [`crate::update`]. On unless switched off.
+    pub check_for_updates: bool,
+    /// A version the user chose to skip, so it is not offered again.
+    pub skipped_update: Option<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            appearance: Appearance::default(),
+            tenant_id: String::new(),
+            client_id: String::new(),
+            mariadb: MariaDbSettings::default(),
+            debug_logging: false,
+            check_for_updates: true,
+            skipped_update: None,
+        }
+    }
 }
 
 impl Config {

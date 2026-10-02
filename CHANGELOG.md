@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.3.0]
+
+- Grant permissions… on the Connection tab: an administrator signs in once in
+  the browser, and the app adds the Graph permissions it uses to the app
+  registration's API permissions list and grants admin consent for them,
+  then signs in again to pick them up. The sign-in uses Microsoft Graph
+  Command Line Tools with PKCE and a one-off `localhost` listener, so the
+  app registration needs no redirect URI. The administrator's token is not
+  kept.
+- Automatic updates. At startup the app asks GitHub for the latest release;
+  a banner offers a newer one, and Install and restart downloads it, checks
+  it against GitHub's published SHA-256 digest, replaces the `.app`,
+  `gcm.exe` or (through `pkexec apt-get`) the `.deb`, and starts the new
+  version. A version can be skipped, the check switched off under Settings,
+  and Settings has a Check now button.
+
 ## [1.2.0]
 
 - A Licensing tab: every subscription with its assigned, available and

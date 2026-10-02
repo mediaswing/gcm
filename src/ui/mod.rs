@@ -8,6 +8,7 @@ pub mod groups;
 pub mod licensing;
 pub mod logs;
 pub mod settings;
+pub mod update;
 pub mod users;
 
 use egui::{Atom, Color32, Id, Response, RichText, Ui, Widget as _};

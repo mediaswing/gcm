@@ -13,6 +13,7 @@ mod secrets;
 mod task;
 mod theme;
 mod ui;
+mod update;
 
 /// The name shown in the title bar, and the one the README uses. The binary
 /// itself stays `gcm`.
@@ -20,6 +21,7 @@ pub const APP_NAME: &str = "Graphical Cloud Manager";
 
 fn main() -> eframe::Result {
     logging::init();
+    update::clean_up();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
