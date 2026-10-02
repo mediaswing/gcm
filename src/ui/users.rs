@@ -17,6 +17,8 @@ use crate::ui;
 /// What a finished action changed, so the list can be patched in place rather
 /// than read again from the start.
 enum Change {
+    /// Nothing the list shows has changed, such as after a password reset.
+    Nothing,
     Upsert(Box<User>),
     Removed(String),
 }
@@ -47,7 +49,10 @@ pub struct State {
     query: String,
     selected: Option<String>,
     memberships: Option<(String, Result<Vec<DirectoryObject>>)>,
-    memberships_load: Option<Task<(String, Vec<DirectoryObject>)>>,
+    /// Carries the user's ID whether it worked or not, so an answer that
+    /// arrives after the selection has moved on is filed under the right
+    /// user.
+    memberships_load: Option<Task<(String, Result<Vec<DirectoryObject>>)>>,
     action: Option<Task<(String, Change)>>,
     form: Option<(Form, Option<String>)>,
     reset: Option<ResetForm>,
@@ -59,6 +64,20 @@ pub struct State {
 }
 
 impl State {
+    pub fn importing(&self) -> bool {
+        self.import.is_some()
+    }
+
+    /// The last import's results, taken out so they can outlive the rest
+    /// of the pane: they may hold the only copy of generated passwords.
+    pub fn take_results(&mut self) -> Option<Vec<ImportResult>> {
+        self.results.take()
+    }
+
+    pub fn restore_results(&mut self, results: Option<Vec<ImportResult>>) {
+        self.results = results;
+    }
+
     pub fn activity(&self) -> Option<String> {
         if self.import.is_some() {
             return self.import_progress.lock().ok().map(|p| p.clone());
@@ -140,7 +159,10 @@ pub fn poll(app: &mut App) {
 
     if let Some(result) = take_finished(&mut app.users.memberships_load) {
         match result {
-            Ok((id, groups)) => app.users.memberships = Some((id, Ok(groups))),
+            Ok((id, groups)) => app.users.memberships = Some((id, groups)),
+            // The thread itself died, so whose answer it was is unknown.
+            // Filed under whoever is selected, so it is not asked again in
+            // a loop.
             Err(err) => {
                 if let Some(id) = app.users.selected.clone() {
                     app.users.memberships = Some((id, Err(err)));
@@ -154,6 +176,7 @@ pub fn poll(app: &mut App) {
             Ok((message, change)) => {
                 let users = &mut app.users.users;
                 match change {
+                    Change::Nothing => {}
                     Change::Upsert(user) => {
                         let user = *user;
                         match users.iter_mut().find(|u| u.id == user.id) {
@@ -443,7 +466,8 @@ fn details(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
     {
         let id = user.id.clone();
         app.users.memberships_load = Some(Task::spawn(ctx, "Loading memberships…", move || {
-            Ok((id.clone(), graph.user_memberships(&id)?))
+            let groups = graph.user_memberships(&id);
+            Ok((id, groups))
         }));
     }
 
@@ -665,10 +689,9 @@ fn reset_modal(app: &mut App, ctx: &egui::Context) {
     match answer {
         Some(true) => {
             let Some(r) = app.users.reset.take() else { return };
-            let user = app.users.selected_user().cloned().unwrap_or_default();
             run(app, ctx, "Resetting password…", move |g| {
                 g.reset_password(&r.id, &r.password, r.force_change)?;
-                Ok((format!("Password reset for {}.", r.name), Change::Upsert(Box::new(user))))
+                Ok((format!("Password reset for {}.", r.name), Change::Nothing))
             });
         }
         Some(false) => app.users.reset = None,

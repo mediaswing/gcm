@@ -317,9 +317,12 @@ fn write_table(
     Ok(count)
 }
 
-/// Run the export. `progress` is a line for the pane to show while it works.
+/// Run the export. `tenant` is what every row is filed under: the tenant's
+/// GUID, so that it is the same however the tenant was typed in at sign-in.
+/// `progress` is a line for the pane to show while it works.
 pub fn run(
     graph: &Graph,
+    tenant: &str,
     settings: &MariaDbSettings,
     choices: Choices,
     progress: &Arc<Mutex<String>>,
@@ -336,7 +339,7 @@ pub fn run(
     let mut conn = settings.connect()?;
     create_tables(&mut conn)?;
 
-    let tenant = graph.tenant_id().trim().to_owned();
+    let tenant = tenant.trim().to_lowercase();
     let now = Value::from(
         chrono::Utc::now()
             .format("%Y-%m-%d %H:%M:%S")
@@ -455,8 +458,10 @@ pub fn run(
         summary.push(format!("{n} groups"));
     }
 
+    let mut warnings = Vec::new();
     if choices.members {
         let mut rows = Vec::new();
+        let mut gone = 0;
         for (i, group) in groups.iter().enumerate() {
             say(&format!(
                 "Reading members of {} ({} of {})…",
@@ -464,7 +469,14 @@ pub fn run(
                 i + 1,
                 groups.len()
             ));
-            for m in graph.group_members(&group.id)? {
+            // A group deleted since the list was read has no members to
+            // copy, and is no reason to abandon all the others.
+            let Some(members) = graph.group_members_if_found(&group.id)? else {
+                log::info!("group {} ({}) has gone; skipping its members", group.name(), group.id);
+                gone += 1;
+                continue;
+            };
+            for m in members {
                 rows.push(vec![
                     Value::from(tenant.as_str()),
                     Value::from(group.id.as_str()),
@@ -475,6 +487,11 @@ pub fn run(
                     now.clone(),
                 ]);
             }
+        }
+        if gone > 0 {
+            warnings.push(format!(
+                "{gone} groups were deleted during the export, so their members were left out."
+            ));
         }
         say(&format!("Writing {} memberships…", rows.len()));
         let n = write_table(
@@ -497,13 +514,12 @@ pub fn run(
         summary.push(format!("{n} memberships"));
     }
 
-    let mut warning = None;
     if choices.devices {
         say("Reading devices from Entra ID and Intune…");
         let list = graph.list_devices()?;
-        warning = list
-            .intune_error
-            .map(|e| format!(" Intune devices were left out: {e}"));
+        if let Some(e) = list.intune_error {
+            warnings.push(format!("Intune devices were left out: {e}"));
+        }
         say(&format!("Writing {} devices…", list.rows.len()));
         let rows = list.rows.iter().map(|r| device_values(&tenant, r, &now)).collect();
         let n = write_table(
@@ -544,12 +560,12 @@ pub fn run(
     if summary.is_empty() {
         return Err("Choose at least one thing to export.".into());
     }
-    Ok(format!(
-        "Exported {} to {}.{}",
-        summary.join(", "),
-        settings.label(),
-        warning.unwrap_or_default()
-    ))
+    let mut message = format!("Exported {} to {}.", summary.join(", "), settings.label());
+    for warning in warnings {
+        message.push(' ');
+        message.push_str(&warning);
+    }
+    Ok(message)
 }
 
 /// A device row is keyed on its Entra object ID when it has one, and on its
@@ -575,7 +591,11 @@ fn device_values(tenant: &str, row: &DeviceRow, now: &Value) -> Vec<Value> {
         text(&e.map(|e| e.id.clone())),
         text(&e.and_then(|e| e.device_id.clone())),
         text(&i.map(|i| i.id.clone())),
-        Value::from(row.name()),
+        // Not `row.name()`, whose "(no name)" is for the screen.
+        text(
+            &e.and_then(|e| e.display_name.clone())
+                .or_else(|| i.and_then(|i| i.device_name.clone())),
+        ),
         text(&os),
         text(&os_version),
         text(&e.and_then(|e| e.trust_type.clone())),

@@ -30,6 +30,10 @@ const TIMEOUT: Duration = Duration::from_secs(60);
 /// Fetch a new token this long before the old one runs out, so a request is
 /// never sent with one that expires on the way.
 const TOKEN_MARGIN: Duration = Duration::from_secs(300);
+/// How many times a throttled request is sent before giving up.
+const ATTEMPTS: u32 = 5;
+/// The longest a single `Retry-After` is waited for, whatever Graph asks.
+const LONGEST_WAIT: Duration = Duration::from_secs(60);
 
 /// The application permissions this app uses, and what each one is for.
 pub const REQUIRED_ROLES: &[(&str, &str)] = &[
@@ -89,6 +93,26 @@ pub struct Session {
     pub organisation: Option<String>,
     /// The application permissions in the token's `roles` claim.
     pub roles: Vec<String>,
+    /// The tenant's GUID, from the token's `tid` claim. The tenant ID that
+    /// was typed in may be a domain name instead, and one tenant can have
+    /// several of those.
+    pub tenant_guid: Option<String>,
+}
+
+/// Why a request failed: the sentence for the status bar, and Graph's
+/// status code when it got as far as answering.
+struct Failure {
+    status: Option<u16>,
+    message: String,
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self {
+            status: None,
+            message,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -117,11 +141,24 @@ impl Graph {
         &self.inner.credentials.tenant_id
     }
 
+    /// What this client signs in with, which is not necessarily what is in
+    /// the Connection pane's boxes by the time the sign-in finishes.
+    pub fn credentials(&self) -> &Credentials {
+        &self.inner.credentials
+    }
+
     /// Sign in, and find out what the sign-in is good for.
     pub fn sign_in(&self) -> Result<Session> {
         let bearer = self.bearer()?;
-        let roles = roles_in(&bearer);
-        log::info!("signed in; the token carries {} roles: {}", roles.len(), roles.join(", "));
+        let claims = claims_in(&bearer);
+        let roles = roles_in(&claims);
+        let tenant_guid = claims["tid"].as_str().map(str::to_lowercase);
+        log::info!(
+            "signed in to tenant {}; the token carries {} roles: {}",
+            tenant_guid.as_deref().unwrap_or("(no tid claim)"),
+            roles.len(),
+            roles.join(", ")
+        );
         // Optional: without Organization.Read.All this is a 403, and that is
         // no reason to refuse to connect.
         let organisation = self
@@ -135,6 +172,7 @@ impl Graph {
         Ok(Session {
             organisation,
             roles,
+            tenant_guid,
         })
     }
 
@@ -197,17 +235,17 @@ impl Graph {
             .map_err(|e| format!("Unreadable answer from Microsoft sign-in: {e}"))?;
 
         if !status.is_success() {
-            // AADSTS messages are long, and the first line says it all.
             let description = body["error_description"]
                 .as_str()
                 .or_else(|| body["error"].as_str())
                 .unwrap_or("unknown error");
-            let first = description.lines().next().unwrap_or(description);
+            // The whole description goes in the log, trace and correlation
+            // IDs included, since those are what Microsoft support asks for.
             log::warn!(
-                "sign-in refused ({}, request-id {request_id}): {first}",
+                "sign-in refused ({}, request-id {request_id}): {description}",
                 status.as_u16()
             );
-            return Err(format!("Sign-in refused: {first}"));
+            return Err(format!("Sign-in refused: {}", aadsts_summary(description)));
         }
 
         #[derive(Deserialize)]
@@ -244,34 +282,93 @@ impl Graph {
     /// Send a request and read the answer, turning a Graph error into its
     /// message. `None` for the many calls that answer 202 or 204 with nothing.
     fn send(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Option<Value>> {
+        self.request(method, path, body).map_err(|f| f.message)
+    }
+
+    /// [`Self::send`], keeping the status code of a failure.
+    ///
+    /// A throttled request (429) is sent again after the wait Graph asks for
+    /// in `Retry-After`, or a growing one when it does not say. So is a GET,
+    /// PATCH or DELETE that met a busy or timed-out service (503, 504):
+    /// sending one of those twice does no harm. A POST that met one is not,
+    /// because it may have been carried out regardless, and creating a user
+    /// twice is worse than reporting the error.
+    fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> std::result::Result<Option<Value>, Failure> {
         let url = Self::url(path)?;
+        let mut attempt = 1;
+        loop {
+            match self.attempt(method, &url, path, body)? {
+                Attempt::Done(value) => return Ok(value),
+                Attempt::Failed {
+                    status,
+                    message,
+                    retry_after,
+                } => {
+                    let Some(wait) = retry_wait(method, status, attempt, retry_after) else {
+                        return Err(Failure {
+                            status: Some(status),
+                            message,
+                        });
+                    };
+                    log::info!(
+                        "{method} {} answered {status}; trying again in {} s (attempt {} of {ATTEMPTS})",
+                        shown(path),
+                        wait.as_secs(),
+                        attempt + 1
+                    );
+                    std::thread::sleep(wait);
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    /// One try at a request.
+    fn attempt(
+        &self,
+        method: &str,
+        url: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> std::result::Result<Attempt, Failure> {
         let auth = format!("Bearer {}", self.bearer()?);
         let agent = &self.inner.agent;
 
+        let started = Instant::now();
         let sent = match (method, body) {
-            ("GET", _) => agent.get(&url).header("Authorization", &auth).call(),
-            ("DELETE", _) => agent.delete(&url).header("Authorization", &auth).call(),
+            ("GET", _) => agent.get(url).header("Authorization", &auth).call(),
+            ("DELETE", _) => agent.delete(url).header("Authorization", &auth).call(),
             ("POST", Some(body)) => agent
-                .post(&url)
+                .post(url)
                 .header("Authorization", &auth)
                 .send_json(body),
             ("POST", None) => agent
-                .post(&url)
+                .post(url)
                 .header("Authorization", &auth)
                 .send_empty(),
             ("PATCH", Some(body)) => agent
-                .patch(&url)
+                .patch(url)
                 .header("Authorization", &auth)
                 .send_json(body),
-            _ => return Err(format!("unsupported request {method} {path}")),
+            _ => return Err(format!("unsupported request {method} {path}").into()),
         };
-        let started = Instant::now();
         let mut response = sent.map_err(|e| {
             log::warn!("{method} {} failed to send: {e}", shown(path));
             format!("Could not reach Microsoft Graph: {e}")
         })?;
         let status = response.status();
         let request_id = request_id(&response);
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse().ok())
+            .map(Duration::from_secs);
         let text = response
             .body_mut()
             .with_config()
@@ -281,13 +378,17 @@ impl Graph {
 
         let millis = started.elapsed().as_millis();
         if !status.is_success() {
-            let error = graph_error(status.as_u16(), &text);
+            let message = graph_error(status.as_u16(), &text);
             log::warn!(
-                "{method} {} answered {} in {millis} ms (request-id {request_id}): {error}",
+                "{method} {} answered {} in {millis} ms (request-id {request_id}): {message}",
                 shown(path),
                 status.as_u16()
             );
-            return Err(error);
+            return Ok(Attempt::Failed {
+                status: status.as_u16(),
+                message,
+                retry_after,
+            });
         }
         log::debug!(
             "{method} {} answered {} in {millis} ms, {} bytes (request-id {request_id})",
@@ -296,11 +397,11 @@ impl Graph {
             text.len()
         );
         if text.trim().is_empty() {
-            return Ok(None);
+            return Ok(Attempt::Done(None));
         }
         serde_json::from_str(&text)
-            .map(Some)
-            .map_err(|e| format!("Unexpected answer from Microsoft Graph: {e}"))
+            .map(|v| Attempt::Done(Some(v)))
+            .map_err(|e| format!("Unexpected answer from Microsoft Graph: {e}").into())
     }
 
     pub fn get(&self, path: &str) -> Result<Value> {
@@ -310,10 +411,34 @@ impl Graph {
 
     /// Every page of a collection, following `@odata.nextLink` to the end.
     pub fn get_all<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Vec<T>> {
+        self.collect(path).map_err(|f| f.message)
+    }
+
+    /// [`Self::get_all`], or `None` when what it belongs to has gone (404):
+    /// deleted, say, between being listed and being read.
+    pub fn get_all_if_found<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<Option<Vec<T>>> {
+        match self.collect(path) {
+            Ok(items) => Ok(Some(items)),
+            Err(Failure {
+                status: Some(404), ..
+            }) => Ok(None),
+            Err(failure) => Err(failure.message),
+        }
+    }
+
+    fn collect<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> std::result::Result<Vec<T>, Failure> {
         let mut items = Vec::new();
         let mut next = Some(path.to_owned());
         while let Some(page_url) = next.take() {
-            let mut page = self.get(&page_url)?;
+            let mut page = self
+                .request("GET", &page_url, None)?
+                .ok_or_else(|| "Microsoft Graph sent an empty answer.".to_owned())?;
             if let Value::Array(values) = page["value"].take() {
                 for value in values {
                     items.push(
@@ -343,6 +468,40 @@ impl Graph {
     pub fn delete(&self, path: &str) -> Result<()> {
         self.send("DELETE", path, None).map(drop)
     }
+}
+
+/// How one try at a request went, short of failing to reach Graph at all.
+enum Attempt {
+    Done(Option<Value>),
+    Failed {
+        status: u16,
+        message: String,
+        retry_after: Option<Duration>,
+    },
+}
+
+/// How long to wait before sending a failed request again, or `None` to give
+/// up; see [`Graph::request`] for which failures are worth another try.
+fn retry_wait(method: &str, status: u16, attempt: u32, retry_after: Option<Duration>) -> Option<Duration> {
+    let again = status == 429 || (matches!(status, 503 | 504) && method != "POST");
+    (again && attempt < ATTEMPTS).then(|| {
+        retry_after
+            .unwrap_or_else(|| Duration::from_secs(2u64.pow(attempt)))
+            .min(LONGEST_WAIT)
+    })
+}
+
+/// An AADSTS description without what follows the sentence that matters.
+/// Microsoft appends the trace and correlation IDs and a timestamp, on new
+/// lines or, lately, on the same one; they are in the log, and in the status
+/// bar they only push the explanation out of sight.
+fn aadsts_summary(description: &str) -> &str {
+    let first = description.lines().next().unwrap_or(description);
+    first
+        .split(" Trace ID:")
+        .next()
+        .unwrap_or(first)
+        .trim()
 }
 
 /// The ID Microsoft gives each request, which its support asks for. Graph
@@ -385,20 +544,22 @@ fn graph_error(status: u16, body: &str) -> String {
     }
 }
 
-/// The `roles` claim of an access token, which is where an app-only token
-/// lists the application permissions it was granted. The token is only read,
-/// never verified: it came straight from Microsoft over TLS, and nothing is
-/// decided on it except what to show.
-fn roles_in(token: &str) -> Vec<String> {
-    let Some(payload) = token.split('.').nth(1) else {
-        return Vec::new();
-    };
-    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
-        return Vec::new();
-    };
-    let Ok(claims) = serde_json::from_slice::<Value>(&bytes) else {
-        return Vec::new();
-    };
+/// The claims in an access token's payload, or `null` if it has none that
+/// can be read. The token is only read, never verified: it came straight
+/// from Microsoft over TLS, and nothing is decided on it except what to show
+/// and which tenant the export files rows under.
+fn claims_in(token: &str) -> Value {
+    token
+        .split('.')
+        .nth(1)
+        .and_then(|payload| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null)
+}
+
+/// The `roles` claim, which is where an app-only token lists the application
+/// permissions it was granted.
+fn roles_in(claims: &Value) -> Vec<String> {
     let mut roles: Vec<String> = claims["roles"]
         .as_array()
         .map(|r| r.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
@@ -431,15 +592,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roles_are_read_from_the_token_payload() {
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(r#"{"roles":["User.ReadWrite.All","Device.ReadWrite.All"]}"#);
-        let token = format!("header.{payload}.signature");
+    fn roles_and_tenant_are_read_from_the_token_payload() {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            r#"{"tid":"ABC","roles":["User.ReadWrite.All","Device.ReadWrite.All"]}"#,
+        );
+        let claims = claims_in(&format!("header.{payload}.signature"));
         assert_eq!(
-            roles_in(&token),
+            roles_in(&claims),
             vec!["Device.ReadWrite.All", "User.ReadWrite.All"]
         );
-        assert!(roles_in("not a token").is_empty());
+        assert_eq!(claims["tid"], "ABC");
+        assert!(roles_in(&claims_in("not a token")).is_empty());
+    }
+
+    #[test]
+    fn throttling_is_waited_out_but_a_post_is_never_repeated_blindly() {
+        let secs = Duration::from_secs;
+        assert_eq!(retry_wait("GET", 429, 1, Some(secs(7))), Some(secs(7)));
+        assert_eq!(retry_wait("POST", 429, 1, None), Some(secs(2)));
+        assert_eq!(retry_wait("GET", 503, 3, None), Some(secs(8)));
+        assert_eq!(retry_wait("GET", 429, 1, Some(secs(3600))), Some(LONGEST_WAIT));
+        assert_eq!(retry_wait("POST", 503, 1, None), None);
+        assert_eq!(retry_wait("GET", 404, 1, None), None);
+        assert_eq!(retry_wait("GET", 429, ATTEMPTS, None), None);
+    }
+
+    #[test]
+    fn sign_in_errors_lose_their_trace_ids() {
+        let one_line = "AADSTS90002: Tenant 'x' not found. Check the tenant ID. Trace ID: eb43 Correlation ID: 1c36 Timestamp: 2026-10-02 20:30:48Z";
+        assert_eq!(
+            aadsts_summary(one_line),
+            "AADSTS90002: Tenant 'x' not found. Check the tenant ID."
+        );
+        let lines = "AADSTS7000215: Invalid client secret provided.\r\nTrace ID: eb43\r\n";
+        assert_eq!(aadsts_summary(lines), "AADSTS7000215: Invalid client secret provided.");
     }
 
     #[test]

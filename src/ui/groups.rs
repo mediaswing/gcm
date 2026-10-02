@@ -26,7 +26,9 @@ pub struct State {
     query: String,
     selected: Option<String>,
     members: Option<(String, Result<Vec<DirectoryObject>>)>,
-    members_load: Option<Task<(String, Vec<DirectoryObject>)>>,
+    /// Carries the group's ID whether it worked or not, as in the Users
+    /// pane.
+    members_load: Option<Task<(String, Result<Vec<DirectoryObject>>)>>,
     action: Option<Task<(String, Change)>>,
     /// The sign-in name typed into the "add member" box.
     new_member: String,
@@ -85,7 +87,8 @@ fn run(
 fn load_members(app: &mut App, ctx: &egui::Context, group_id: String) {
     let Some(graph) = app.graph.clone() else { return };
     app.groups.members_load = Some(Task::spawn(ctx, "Loading members…", move || {
-        Ok((group_id.clone(), graph.group_members(&group_id)?))
+        let members = graph.group_members(&group_id);
+        Ok((group_id, members))
     }));
 }
 
@@ -106,7 +109,8 @@ pub fn poll(app: &mut App) {
 
     if let Some(result) = take_finished(&mut app.groups.members_load) {
         match result {
-            Ok((id, members)) => app.groups.members = Some((id, Ok(members))),
+            Ok((id, members)) => app.groups.members = Some((id, members)),
+            // The thread died; see the Users pane.
             Err(err) => {
                 if let Some(id) = app.groups.selected.clone() {
                     app.groups.members = Some((id, Err(err)));

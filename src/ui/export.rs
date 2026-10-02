@@ -266,10 +266,17 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 settings.test()
             }));
         } else if let Some(graph) = app.graph.clone() {
+            // Rows are filed under the tenant's GUID, so a tenant signed in
+            // to by one of its domain names lands in the same rows.
+            let tenant = app
+                .session
+                .as_ref()
+                .and_then(|s| s.tenant_guid.clone())
+                .unwrap_or_else(|| graph.tenant_id().to_owned());
             let choices = app.export.choices;
             let progress = app.export.progress.clone();
             app.export.export = Some(Task::spawn(&ctx, "Exporting…", move || {
-                crate::export::run(&graph, &settings, choices, &progress)
+                crate::export::run(&graph, &tenant, &settings, choices, &progress)
             }));
         }
     }

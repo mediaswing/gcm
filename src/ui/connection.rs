@@ -55,7 +55,7 @@ pub fn sign_in_at_start(app: &mut App, ctx: &egui::Context) {
 }
 
 fn start(app: &mut App, ctx: &egui::Context) {
-    if app.connection.signing_in.is_some() {
+    if app.connection.signing_in.is_some() || app.users.importing() {
         return;
     }
     let graph = Graph::new(Credentials {
@@ -81,17 +81,20 @@ pub fn poll(app: &mut App) {
     };
     match result {
         Ok((graph, session)) => {
-            let state = &app.connection;
-            app.config.tenant_id = state.tenant_id.trim().to_owned();
-            app.config.client_id = state.client_id.trim().to_owned();
+            // What the sign-in used, not what is in the boxes now: they can
+            // be edited while it is under way, and a secret must only ever
+            // be remembered beside the tenant and client it worked for.
+            let used = graph.credentials();
+            app.config.tenant_id = used.tenant_id.clone();
+            app.config.client_id = used.client_id.clone();
 
             // The credentials file holds one app registration's secret: the
             // one just used, or none if the user would rather not keep it.
             let mut stored = secrets::load();
-            if state.remember_secret {
-                stored.tenant_id = app.config.tenant_id.clone();
-                stored.client_id = app.config.client_id.clone();
-                stored.client_secret = state.client_secret.clone();
+            if app.connection.remember_secret {
+                stored.tenant_id = used.tenant_id.clone();
+                stored.client_id = used.client_id.clone();
+                stored.client_secret = used.client_secret.clone();
             } else {
                 stored.tenant_id.clear();
                 stored.client_id.clear();
@@ -139,7 +142,10 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         "Sign in as an app registration in your Entra ID tenant, using its tenant ID, client ID and a client secret.",
     );
     let ctx = ui.ctx().clone();
-    let busy = app.connection.signing_in.is_some();
+    // Signing out or in again clears the Users pane, and with it the
+    // results of an import still running, generated passwords and all.
+    let importing = app.users.importing();
+    let busy = app.connection.signing_in.is_some() || importing;
 
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.set_max_width(640.0);
@@ -167,7 +173,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         ui.add_space(10.0);
 
         let signed_in = app.graph.is_some();
-        let label = if busy {
+        let label = if app.connection.signing_in.is_some() {
             "Signing in…"
         } else if signed_in {
             "Sign in again"
@@ -186,6 +192,14 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             if ui.add_enabled(!busy, egui::Button::new("Sign out")).clicked() {
                 sign_out(app);
             }
+        }
+        if importing {
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("A CSV import is running. Signing in or out waits until it has finished.")
+                    .size(13.0)
+                    .color(ui::warn_colour(ui)),
+            );
         }
         if let Some(error) = &app.connection.error {
             ui.add_space(6.0);

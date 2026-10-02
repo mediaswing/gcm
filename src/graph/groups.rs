@@ -52,11 +52,21 @@ impl Graph {
     }
 
     pub fn group_members(&self, group_id: &str) -> Result<Vec<DirectoryObject>> {
-        let mut members: Vec<DirectoryObject> = self.get_all(&format!(
+        self.group_members_if_found(group_id)?
+            .ok_or_else(|| "The group no longer exists. Refresh the list.".to_owned())
+    }
+
+    /// The members, or `None` if the group has been deleted since it was
+    /// listed.
+    pub fn group_members_if_found(&self, group_id: &str) -> Result<Option<Vec<DirectoryObject>>> {
+        let Some(mut members) = self.get_all_if_found::<DirectoryObject>(&format!(
             "/groups/{group_id}/members?$select=id,displayName,userPrincipalName,mail&$top=999"
-        ))?;
+        ))?
+        else {
+            return Ok(None);
+        };
         members.sort_by_key(|m| m.name().to_lowercase());
-        Ok(members)
+        Ok(Some(members))
     }
 
     pub fn create_group(&self, group: &NewGroup) -> Result<Group> {

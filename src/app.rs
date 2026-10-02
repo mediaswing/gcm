@@ -94,9 +94,13 @@ impl App {
         app
     }
 
-    /// A new tenant, or none: everything loaded from the old one goes.
+    /// A new tenant, or none: everything loaded from the old one goes,
+    /// except the last import's results, which may hold the only copy of
+    /// the passwords it generated and stay until they are dismissed.
     pub fn forget_directory(&mut self) {
+        let results = self.users.take_results();
         self.users = ui::users::State::default();
+        self.users.restore_results(results);
         self.groups = ui::groups::State::default();
         self.devices = ui::devices::State::default();
     }

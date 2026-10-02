@@ -49,8 +49,9 @@ impl Filter {
 enum Change {
     Nothing,
     EntraEnabled(String, bool),
-    /// Gone entirely, or only its Intune half, when the key is an Intune ID.
+    /// The Entra half has gone. An Intune half, if there was one, stays.
     EntraRemoved(String),
+    /// The Intune half has gone. An Entra half, if there was one, stays.
     IntuneRemoved(String),
 }
 
@@ -173,7 +174,19 @@ pub fn poll(app: &mut App) {
                         }
                     }
                     Change::EntraRemoved(id) => {
-                        rows.retain(|r| r.entra.as_ref().is_none_or(|e| e.id != id));
+                        for r in rows.iter_mut() {
+                            if r.entra.as_ref().is_some_and(|e| e.id == id) {
+                                r.entra = None;
+                                // The row is now known by its Intune ID, so
+                                // the selection follows it there.
+                                if let Some(i) = &r.intune
+                                    && app.devices.selected == Some(Key::Entra(id.clone()))
+                                {
+                                    app.devices.selected = Some(Key::Intune(i.id.clone()));
+                                }
+                            }
+                        }
+                        rows.retain(|r| r.entra.is_some() || r.intune.is_some());
                     }
                     Change::IntuneRemoved(id) => {
                         for r in rows.iter_mut() {

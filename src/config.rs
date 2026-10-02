@@ -84,6 +84,10 @@ impl Config {
 /// is created. A file that was already there is narrowed to the owner
 /// *before* it is emptied and refilled, so the new contents are never
 /// readable by anyone else, even for an instant.
+///
+/// On Windows there is no mode to set: the file takes the permissions of
+/// the folder it is created in. Inside the user's profile, where the app's
+/// own files live, that normally means the user and administrators only.
 pub fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     {

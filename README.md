@@ -65,10 +65,12 @@ The tenant ID, the client ID and the MariaDB server details are saved in
 Secrets never go in that file. If you tick **Remember the secret**, the
 client secret is saved in `.gcm-credentials.json` in your home directory, and
 the app signs in by itself at the next start. The MariaDB password can be
-remembered in the same file. The file is set read-only and readable only by
-you: mode `0400` on macOS and Linux, and the read-only attribute on Windows.
-The app makes it writable just long enough to update it, and deletes it once
-nothing is left in it.
+remembered in the same file. On macOS and Linux the file is set to mode
+`0400`, read-only and readable only by you. On Windows it gets the read-only
+attribute, and who can read it is decided by your user profile's own
+permissions, which normally admit only you and administrators. The app makes
+it writable just long enough to update it, and deletes it once nothing is
+left in it.
 
 It is plain JSON, so you can also write it yourself, for example to set up a
 machine without typing anything into the window:
@@ -174,7 +176,8 @@ The client secret, access tokens, passwords and request bodies are never
 written to it. Paths and messages can include object IDs, sign-in names and
 group names, so look through the file before sharing it.
 
-The file is readable only by you. Once it passes 5 MB, it is moved to
+On macOS and Linux the file is readable only by you; on Windows it takes the
+permissions of your user profile. Once it passes 5 MB, it is moved to
 `gcm-debug.log.1` the next time logging starts, replacing any older one.
 
 Warnings still go to the terminal as before, and `RUST_LOG` controls that as
@@ -198,9 +201,11 @@ That means a file from **Export CSV…** can be edited and imported again.
 | `accountEnabled` | no | `true`/`false`, `yes`/`no` or `1`/`0`. Defaults to `true` |
 | `forceChangePasswordNextSignIn` | no | Same values. Defaults to `true` |
 
-The results file can contain passwords, so it is written readable only by
-you. Keep it somewhere safe and delete it once the passwords have been handed
-over.
+The results file can contain passwords. On macOS and Linux it is written
+readable only by you. On Windows it takes the permissions of the folder you
+save it in, so save it inside your own user folder rather than a shared one.
+Either way, keep it somewhere safe and delete it once the passwords have been
+handed over.
 
 ## Exporting to MariaDB
 
