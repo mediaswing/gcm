@@ -41,7 +41,7 @@ jobs:
         os: [ubuntu-24.04, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - if: runner.os == 'Linux'
@@ -94,7 +94,7 @@ jobs:
             scan: target/release/gcm.exe
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - if: runner.os == 'Linux'
@@ -114,13 +114,13 @@ jobs:
       # step's log.
       - name: Submit to VirusTotal
         if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/v')
-        uses: crazy-max/ghaction-virustotal@v4
+        uses: crazy-max/ghaction-virustotal@v5
         with:
           vt_api_key: ${{ secrets.VT_API_KEY }}
           files: ${{ matrix.scan }}
           # The free API allows 4 requests a minute, shared by all three jobs.
           request_rate: 1
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.files }}
@@ -128,7 +128,7 @@ jobs:
       # The same files, handed to the release job for VirusTotal. Not
       # published: the release itself carries the archives they came in.
       - if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: scan-${{ matrix.artifact }}
           path: ${{ matrix.scan }}
@@ -145,7 +145,7 @@ jobs:
     steps:
       # Only for CHANGELOG.md, whose section for this version becomes the
       # release notes.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
           sparse-checkout: CHANGELOG.md
@@ -169,13 +169,13 @@ jobs:
           fi
           cat "$RUNNER_TEMP/notes.md"
       - name: Download the packages
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: gcm-*
           path: dist
           merge-multiple: true
       - name: Download the files to scan
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: scan-gcm-*
           path: scan
@@ -184,7 +184,7 @@ jobs:
       # pull requests merged, and a link to compare with the last release)
       # are added after them.
       - name: Create the release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           body_path: ${{ runner.temp }}/notes.md
@@ -193,7 +193,7 @@ jobs:
       # Once the release exists, submit its files to VirusTotal.
       - name: Submit to VirusTotal
         id: virustotal
-        uses: crazy-max/ghaction-virustotal@v4
+        uses: crazy-max/ghaction-virustotal@v5
         with:
           vt_api_key: ${{ secrets.VT_API_KEY }}
           files: scan/*
