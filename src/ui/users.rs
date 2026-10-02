@@ -8,6 +8,7 @@ use egui_extras::Column;
 
 use crate::app::{App, Tab};
 use crate::csvio::{self, ImportResult, ImportRow};
+use crate::graph::licensing::Licensee;
 use crate::graph::models::{DirectoryObject, User, short_time};
 use crate::graph::users::{NewUser, UserEdit, generate_password};
 use crate::graph::{Graph, Result};
@@ -21,6 +22,15 @@ enum Change {
     Nothing,
     Upsert(Box<User>),
     Removed(String),
+    /// Licences changed; read them again, here and on the Licensing tab.
+    Licences,
+}
+
+/// The Licences dialog: one user, and the products ticked for them.
+struct LicenceForm {
+    user: Licensee,
+    /// SKU IDs, lower case, of the licences to hold directly.
+    direct: std::collections::BTreeSet<String>,
 }
 
 enum Form {
@@ -57,6 +67,11 @@ pub struct State {
     form: Option<(Form, Option<String>)>,
     reset: Option<ResetForm>,
     confirm_delete: Option<(String, String)>,
+    /// The selected user's licences, carried with their ID as memberships
+    /// are.
+    licences: Option<(String, Result<Licensee>)>,
+    licences_load: Option<Task<(String, Result<Licensee>)>>,
+    licence_form: Option<LicenceForm>,
     preview: Option<ImportPreview>,
     import: Option<Task<Vec<ImportResult>>>,
     import_progress: Arc<Mutex<String>>,
@@ -64,6 +79,11 @@ pub struct State {
 }
 
 impl State {
+    /// Licences have changed somewhere, so whatever is shown is read again.
+    pub fn forget_licences(&mut self) {
+        self.licences = None;
+    }
+
     pub fn importing(&self) -> bool {
         self.import.is_some()
     }
@@ -171,14 +191,32 @@ pub fn poll(app: &mut App) {
         }
     }
 
+    if let Some(result) = take_finished(&mut app.users.licences_load) {
+        match result {
+            Ok(answer) => app.users.licences = Some(answer),
+            // As for memberships above.
+            Err(err) => {
+                if let Some(id) = app.users.selected.clone() {
+                    app.users.licences = Some((id, Err(err)));
+                }
+            }
+        }
+    }
+
     if let Some(result) = take_finished(&mut app.users.action) {
         match result {
             Ok((message, change)) => {
                 let users = &mut app.users.users;
                 match change {
                     Change::Nothing => {}
+                    Change::Licences => {
+                        app.users.licences = None;
+                        app.licensing.invalidate();
+                    }
                     Change::Upsert(user) => {
                         let user = *user;
+                        // A new usage location changes what can be assigned.
+                        app.users.licences = None;
                         match users.iter_mut().find(|u| u.id == user.id) {
                             Some(existing) => *existing = user,
                             None => {
@@ -197,7 +235,11 @@ pub fn poll(app: &mut App) {
                 }
                 app.report_ok(message);
             }
-            Err(err) => app.report_error(err),
+            Err(err) => {
+                // A licence change can fail half-way, so read them again.
+                app.users.licences = None;
+                app.report_error(err);
+            }
         }
     }
 
@@ -470,6 +512,19 @@ fn details(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
             Ok((id, groups))
         }));
     }
+    let have = app.users.licences.as_ref().map(|(id, _)| id.as_str());
+    if have != Some(user.id.as_str())
+        && app.users.licences_load.is_none()
+        && let Some(graph) = graph(app)
+    {
+        let id = user.id.clone();
+        app.users.licences_load = Some(Task::spawn(ctx, "Loading licences…", move || {
+            let licences = graph.licensee(&id);
+            Ok((id, licences))
+        }));
+    }
+    // The product names come from the subscriptions list.
+    ui::licensing::ensure_loaded(app, ctx);
 
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.add_space(8.0);
@@ -510,6 +565,30 @@ fn details(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
             if ui::tool_button(ui, idle, "Delete").clicked() {
                 app.users.confirm_delete = Some((user.id.clone(), user.name().to_owned()));
             }
+            let licensee = match &app.users.licences {
+                Some((id, Ok(l))) if *id == user.id => Some(l.clone()),
+                _ => None,
+            };
+            if ui::tool_button(ui, idle && licensee.is_some(), "Licences…").clicked()
+                && let Some(licensee) = licensee
+            {
+                let direct = licensee
+                    .license_assignment_states
+                    .iter()
+                    .filter(|s| s.assigned_by_group.is_none())
+                    .map(|s| s.sku_id.to_lowercase())
+                    .collect();
+                app.users.licence_form = Some(LicenceForm {
+                    user: licensee,
+                    direct,
+                });
+            }
+            if ui::tool_button(ui, !user.upn().is_empty(), "Sign-ins")
+                .on_hover_text("This user's sign-ins, on the Logs tab")
+                .clicked()
+            {
+                ui::logs::sign_ins_for(app, ctx, user.upn());
+            }
         });
         if user.on_premises_sync_enabled == Some(true) {
             ui.label(
@@ -535,6 +614,10 @@ fn details(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
         ui::property(ui, "Object ID", &user.id);
 
         ui.add_space(8.0);
+        ui.label(RichText::new("Licences").strong());
+        licences_list(app, ui, &user.id);
+
+        ui.add_space(8.0);
         ui.label(RichText::new("Member of").strong());
         match &app.users.memberships {
             Some((id, Ok(groups))) if *id == user.id => {
@@ -551,7 +634,153 @@ fn details(app: &mut App, ui: &mut Ui, ctx: &egui::Context) {
     });
 }
 
+/// A product's name, from the subscriptions list if it has been read, or
+/// its SKU ID if not.
+fn product_name(app: &App, sku_id: &str) -> String {
+    app.licensing
+        .skus()
+        .and_then(|skus| skus.iter().find(|s| s.sku_id.eq_ignore_ascii_case(sku_id)))
+        .map_or_else(|| sku_id.to_owned(), |s| s.name().to_owned())
+}
+
+fn licences_list(app: &App, ui: &mut Ui, user_id: &str) {
+    match &app.users.licences {
+        Some((id, Ok(licensee))) if id == user_id => {
+            // One line per product, however many ways it is held.
+            let mut skus: Vec<&str> = licensee
+                .license_assignment_states
+                .iter()
+                .map(|s| s.sku_id.as_str())
+                .collect();
+            skus.sort_unstable_by_key(|s| s.to_lowercase());
+            skus.dedup_by_key(|s| s.to_lowercase());
+            if skus.is_empty() {
+                ui.label(RichText::new("No licences.").weak());
+            }
+            for sku in skus {
+                let how = match (licensee.holds_directly(sku), licensee.groups_for(sku).len()) {
+                    (true, 0) => "direct",
+                    (true, _) => "direct and through a group",
+                    (false, _) => "through a group",
+                };
+                ui.label(format!("{}  ·  {how}", product_name(app, sku)));
+                if let Some(problem) = licensee.problem_with(sku) {
+                    ui.label(RichText::new(problem).size(12.0).color(ui::bad_colour(ui)));
+                }
+            }
+            if !licensee.usage_location.as_deref().is_some_and(|l| !l.is_empty()) {
+                ui.label(
+                    RichText::new("No usage location: set one with Edit before assigning a licence.")
+                        .size(12.0)
+                        .color(ui::warn_colour(ui)),
+                );
+            }
+        }
+        Some((id, Err(err))) if id == user_id => ui::error_text(ui, err),
+        _ => ui::busy(ui, "Loading…"),
+    }
+}
+
+fn licence_modal(app: &mut App, ctx: &egui::Context) {
+    if app.users.licence_form.is_none() {
+        return;
+    }
+    ui::licensing::ensure_loaded(app, ctx);
+    let skus: Option<Vec<_>> = app
+        .licensing
+        .skus()
+        .map(|s| s.iter().filter(|s| s.assignable()).cloned().collect());
+    let Some(form) = app.users.licence_form.as_mut() else { return };
+    let mut answer = None;
+
+    let modal = egui::Modal::new(egui::Id::new("licence-form")).show(ctx, |ui| {
+        ui.set_width(480.0);
+        ui.heading("Licences");
+        ui.label(RichText::new(form.user.upn()).weak());
+        ui.add_space(8.0);
+        let Some(skus) = &skus else {
+            ui::busy(ui, "Loading subscriptions…");
+            answer = ui::form_buttons(ui, "Save", false);
+            return;
+        };
+        if skus.is_empty() {
+            ui.label("The tenant has no licences that can be assigned to users.");
+        }
+        egui::ScrollArea::vertical()
+            .max_height(ctx.content_rect().height() - 220.0)
+            .show(ui, |ui| {
+                for sku in skus {
+                    let id = sku.sku_id.to_lowercase();
+                    let had = form.user.holds_directly(&id);
+                    let mut ticked = form.direct.contains(&id);
+                    // Adding needs one free; keeping one already held does not.
+                    let can_tick = had || ticked || sku.available() > 0;
+                    let label = format!("{}  ({} available)", sku.name(), sku.available());
+                    if ui
+                        .add_enabled(can_tick, egui::Checkbox::new(&mut ticked, label))
+                        .changed()
+                    {
+                        if ticked {
+                            form.direct.insert(id.clone());
+                        } else {
+                            form.direct.remove(&id);
+                        }
+                    }
+                    if !form.user.groups_for(&id).is_empty() {
+                        ui.label(
+                            RichText::new("Also held through a group, which this does not change.")
+                                .size(12.0)
+                                .weak(),
+                        );
+                    }
+                }
+            });
+        if !form.user.usage_location.as_deref().is_some_and(|l| !l.is_empty()) {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("This user has no usage location, so licences can be removed but not added. Set one with Edit.")
+                    .size(12.0)
+                    .color(ui::warn_colour(ui)),
+            );
+        }
+        answer = ui::form_buttons(ui, "Save", true);
+    });
+    if modal.should_close() && answer.is_none() {
+        answer = Some(false);
+    }
+    match answer {
+        Some(true) => {
+            let Some(form) = app.users.licence_form.take() else { return };
+            let held: std::collections::BTreeSet<String> = form
+                .user
+                .license_assignment_states
+                .iter()
+                .filter(|s| s.assigned_by_group.is_none())
+                .map(|s| s.sku_id.to_lowercase())
+                .collect();
+            let add: Vec<String> = form.direct.difference(&held).cloned().collect();
+            let remove: Vec<String> = held.difference(&form.direct).cloned().collect();
+            if add.is_empty() && remove.is_empty() {
+                return;
+            }
+            let user = form.user;
+            run(app, ctx, "Changing licences…", move |g| {
+                g.change_licences(&user, &add, &remove)?;
+                let message = match (add.len(), remove.len()) {
+                    (a, 0) => format!("Assigned {a} licence(s) to {}.", user.upn()),
+                    (0, r) => format!("Removed {r} licence(s) from {}.", user.upn()),
+                    (a, r) => format!("Assigned {a} and removed {r} licence(s) for {}.", user.upn()),
+                };
+                Ok((message, Change::Licences))
+            });
+        }
+        Some(false) => app.users.licence_form = None,
+        None => {}
+    }
+}
+
 pub fn modals(app: &mut App, ctx: &egui::Context) {
+    licence_modal(app, ctx);
     form_modal(app, ctx);
     reset_modal(app, ctx);
     delete_modal(app, ctx);

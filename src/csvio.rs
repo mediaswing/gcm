@@ -8,6 +8,7 @@
 
 use std::path::Path;
 
+use crate::graph::logs::{DirectoryAudit, SignIn, log_time};
 use crate::graph::models::User;
 use crate::graph::users::NewUser;
 
@@ -253,6 +254,101 @@ pub fn write_users(path: &Path, users: &[&User]) -> Result<(), String> {
     writer.flush().map_err(|e| e.to_string())
 }
 
+pub fn write_sign_ins(path: &Path, sign_ins: &[&SignIn]) -> Result<(), String> {
+    let mut writer = csv::Writer::from_path(path).map_err(|e| e.to_string())?;
+    writer
+        .write_record([
+            "time", "userPrincipalName", "userDisplayName", "app", "resource", "result",
+            "errorCode", "failureReason", "ipAddress", "location", "clientApp", "interactive",
+            "conditionalAccess", "operatingSystem", "browser", "deviceName", "correlationId", "id",
+        ])
+        .map_err(|e| e.to_string())?;
+    let s = |v: &Option<String>| to_cell(v.as_deref().unwrap_or_default());
+    for i in sign_ins {
+        let d = &i.device_detail;
+        writer
+            .write_record([
+                log_time(i.created_date_time.as_deref()),
+                s(&i.user_principal_name),
+                s(&i.user_display_name),
+                s(&i.app_display_name),
+                s(&i.resource_display_name),
+                (if i.succeeded() { "success" } else { "failure" }).to_owned(),
+                i.status.error_code.map(|c| c.to_string()).unwrap_or_default(),
+                s(&i.status.failure_reason),
+                s(&i.ip_address),
+                to_cell(&i.place()),
+                s(&i.client_app_used),
+                i.is_interactive.map(|b| b.to_string()).unwrap_or_default(),
+                s(&i.conditional_access_status),
+                s(&d.operating_system),
+                s(&d.browser),
+                s(&d.display_name),
+                s(&i.correlation_id),
+                to_cell(&i.id),
+            ])
+            .map_err(|e| e.to_string())?;
+    }
+    writer.flush().map_err(|e| e.to_string())
+}
+
+/// One row per audit entry. The targets and the properties changed are
+/// joined into one cell each, `name: old -> new` separated by `; `.
+pub fn write_audits(path: &Path, audits: &[&DirectoryAudit]) -> Result<(), String> {
+    let mut writer = csv::Writer::from_path(path).map_err(|e| e.to_string())?;
+    writer
+        .write_record([
+            "time", "activity", "category", "service", "result", "resultReason", "initiatedBy",
+            "initiatorIpAddress", "targets", "changes", "correlationId", "id",
+        ])
+        .map_err(|e| e.to_string())?;
+    let s = |v: &Option<String>| to_cell(v.as_deref().unwrap_or_default());
+    for a in audits {
+        let targets = a
+            .target_resources
+            .iter()
+            .filter_map(|t| t.name())
+            .collect::<Vec<_>>()
+            .join("; ");
+        let changes = a
+            .target_resources
+            .iter()
+            .flat_map(|t| &t.modified_properties)
+            .map(|p| {
+                format!(
+                    "{}: {} -> {}",
+                    p.display_name.as_deref().unwrap_or("?"),
+                    p.old_value.as_deref().unwrap_or(""),
+                    p.new_value.as_deref().unwrap_or("")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let ip = a
+            .initiated_by
+            .user
+            .as_ref()
+            .and_then(|u| u.ip_address.clone());
+        writer
+            .write_record([
+                log_time(a.activity_date_time.as_deref()),
+                s(&a.activity_display_name),
+                s(&a.category),
+                s(&a.logged_by_service),
+                s(&a.result),
+                s(&a.result_reason),
+                to_cell(&a.initiator()),
+                s(&ip),
+                to_cell(&targets),
+                to_cell(&changes),
+                s(&a.correlation_id),
+                to_cell(&a.id),
+            ])
+            .map_err(|e| e.to_string())?;
+    }
+    writer.flush().map_err(|e| e.to_string())
+}
+
 /// How one import row went, for the results file.
 #[derive(Clone, Debug)]
 pub struct ImportResult {
@@ -367,6 +463,32 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert!(text.contains("'=2+3"), "{text}");
         assert_eq!(rows[0].user.as_ref().unwrap().job_title, "=2+3");
+    }
+
+    #[test]
+    fn log_exports_neutralise_formulas_too() {
+        let path = std::env::temp_dir().join(format!("gcm-test-{}-logs.csv", std::process::id()));
+        let sign_in = SignIn {
+            id: "1".into(),
+            user_display_name: Some("=HYPERLINK(\"http://x\")".into()),
+            ..Default::default()
+        };
+        write_sign_ins(&path, &[&sign_in]).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("'=HYPERLINK"), "{text}");
+        assert!(text.contains(",success,"), "{text}");
+
+        let audit: DirectoryAudit = serde_json::from_str(
+            r#"{"id": "a", "activityDisplayName": "Update user",
+                "targetResources": [{"userPrincipalName": "jo@contoso.com",
+                  "modifiedProperties": [{"displayName": "JobTitle", "oldValue": "[\"A\"]", "newValue": "[\"=1+1\"]"}]}]}"#,
+        )
+        .unwrap();
+        write_audits(&path, &[&audit]).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(text.contains("jo@contoso.com"), "{text}");
+        assert!(text.contains(r#"JobTitle: [""A""] -> [""=1+1""]"#), "{text}");
     }
 
     #[test]

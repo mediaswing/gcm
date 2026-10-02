@@ -13,6 +13,8 @@
 
 pub mod devices;
 pub mod groups;
+pub mod licensing;
+pub mod logs;
 pub mod models;
 pub mod users;
 
@@ -50,6 +52,11 @@ pub const REQUIRED_ROLES: &[(&str, &str)] = &[
         "DeviceManagementManagedDevices.PrivilegedOperations.All",
         "Intune actions: sync, restart, lock, scan, retire, wipe",
     ),
+    (
+        "LicenseAssignment.ReadWrite.All",
+        "List subscriptions, and assign and remove licences",
+    ),
+    ("AuditLog.Read.All", "Read the sign-in and audit logs"),
     ("Organization.Read.All", "Show the tenant's name"),
 ];
 
@@ -411,7 +418,19 @@ impl Graph {
 
     /// Every page of a collection, following `@odata.nextLink` to the end.
     pub fn get_all<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Vec<T>> {
-        self.collect(path).map_err(|f| f.message)
+        self.collect(path, None)
+            .map(|(items, _)| items)
+            .map_err(|f| f.message)
+    }
+
+    /// The first `max` items of a collection, and whether there were more.
+    /// Only as many pages are read as it takes to reach `max`.
+    pub fn get_up_to<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        max: usize,
+    ) -> Result<(Vec<T>, bool)> {
+        self.collect(path, Some(max)).map_err(|f| f.message)
     }
 
     /// [`Self::get_all`], or `None` when what it belongs to has gone (404):
@@ -420,8 +439,8 @@ impl Graph {
         &self,
         path: &str,
     ) -> Result<Option<Vec<T>>> {
-        match self.collect(path) {
-            Ok(items) => Ok(Some(items)),
+        match self.collect(path, None) {
+            Ok((items, _)) => Ok(Some(items)),
             Err(Failure {
                 status: Some(404), ..
             }) => Ok(None),
@@ -429,11 +448,15 @@ impl Graph {
         }
     }
 
+    /// Pages of a collection, up to `max` items if there is a limit, and
+    /// whether there were more than that.
     fn collect<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
-    ) -> std::result::Result<Vec<T>, Failure> {
+        max: Option<usize>,
+    ) -> std::result::Result<(Vec<T>, bool), Failure> {
         let mut items = Vec::new();
+        let mut more = false;
         let mut next = Some(path.to_owned());
         while let Some(page_url) = next.take() {
             let mut page = self
@@ -448,9 +471,21 @@ impl Graph {
                 }
             }
             next = page["@odata.nextLink"].as_str().map(str::to_owned);
+            if let Some(max) = max
+                && items.len() >= max
+            {
+                more = items.len() > max || next.is_some();
+                items.truncate(max);
+                break;
+            }
         }
-        log::debug!("{} items from {}", items.len(), shown(path));
-        Ok(items)
+        log::debug!(
+            "{} items from {}{}",
+            items.len(),
+            shown(path),
+            if more { ", stopped at the limit" } else { "" }
+        );
+        Ok((items, more))
     }
 
     pub fn post(&self, path: &str, body: &Value) -> Result<Option<Value>> {

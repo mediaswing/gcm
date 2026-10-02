@@ -15,16 +15,20 @@ pub enum Tab {
     Users,
     Groups,
     Devices,
+    Licensing,
+    Logs,
     Export,
     Settings,
 }
 
 impl Tab {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 8] = [
         Self::Connection,
         Self::Users,
         Self::Groups,
         Self::Devices,
+        Self::Licensing,
+        Self::Logs,
         Self::Export,
         Self::Settings,
     ];
@@ -35,6 +39,8 @@ impl Tab {
             Self::Users => "Users",
             Self::Groups => "Groups",
             Self::Devices => "Devices",
+            Self::Licensing => "Licensing",
+            Self::Logs => "Logs",
             Self::Export => "Export",
             Self::Settings => "Settings",
         }
@@ -58,6 +64,8 @@ pub struct App {
     pub users: ui::users::State,
     pub groups: ui::groups::State,
     pub devices: ui::devices::State,
+    pub licensing: ui::licensing::State,
+    pub logs: ui::logs::State,
     pub export: ui::export::State,
 }
 
@@ -85,6 +93,8 @@ impl App {
             users: ui::users::State::default(),
             groups: ui::groups::State::default(),
             devices: ui::devices::State::default(),
+            licensing: ui::licensing::State::default(),
+            logs: ui::logs::State::default(),
             export: ui::export::State::from_config(&config),
             config,
         };
@@ -103,6 +113,8 @@ impl App {
         self.users.restore_results(results);
         self.groups = ui::groups::State::default();
         self.devices = ui::devices::State::default();
+        self.licensing = ui::licensing::State::default();
+        self.logs = ui::logs::State::default();
     }
 
     pub fn report_ok(&mut self, message: impl Into<String>) {
@@ -130,6 +142,8 @@ impl App {
             .or_else(|| self.users.activity())
             .or_else(|| self.groups.activity())
             .or_else(|| self.devices.activity())
+            .or_else(|| self.licensing.activity())
+            .or_else(|| self.logs.activity())
             .or_else(|| self.export.activity())
     }
 
@@ -202,6 +216,8 @@ impl eframe::App for App {
         ui::users::poll(self);
         ui::groups::poll(self);
         ui::devices::poll(self);
+        ui::licensing::poll(self);
+        ui::logs::poll(self);
         ui::export::poll(self);
 
         egui::Panel::left("tabs")
@@ -216,6 +232,8 @@ impl eframe::App for App {
             Tab::Users => ui::users::show(self, ui),
             Tab::Groups => ui::groups::show(self, ui),
             Tab::Devices => ui::devices::show(self, ui),
+            Tab::Licensing => ui::licensing::show(self, ui),
+            Tab::Logs => ui::logs::show(self, ui),
             Tab::Export => ui::export::show(self, ui),
             Tab::Settings => ui::settings::show(self, ui),
         });
@@ -224,5 +242,6 @@ impl eframe::App for App {
         ui::users::modals(self, &ctx);
         ui::groups::modals(self, &ctx);
         ui::devices::modals(self, &ctx);
+        ui::licensing::modals(self, &ctx);
     }
 }

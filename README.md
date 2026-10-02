@@ -40,12 +40,20 @@ registration's *application* permissions allow, and nothing more.
 | `Device.ReadWrite.All` | Listing, enabling, disabling and deleting Entra devices |
 | `DeviceManagementManagedDevices.ReadWrite.All` | Listing Intune managed devices |
 | `DeviceManagementManagedDevices.PrivilegedOperations.All` | Intune actions: sync, restart, lock, Defender scan, retire, wipe |
+| `LicenseAssignment.ReadWrite.All` | Listing subscriptions, and assigning and removing licences |
+| `AuditLog.Read.All` | Reading the sign-in and audit logs |
 | `Organization.Read.All` | Showing the tenant's name (optional) |
 
 For a read-only setup, grant the `.Read.All` versions of these instead. The
 lists will load, and any change you try will be refused with a message saying
 so. After you sign in, the **Connection** tab shows which of these
 permissions the token actually carries.
+
+`LicenseAssignment.ReadWrite.All` is the narrowest permission for licences,
+but not the only one that works: `User.ReadWrite.All` can assign them too,
+and `Organization.Read.All` can list the subscriptions. So the Licensing tab
+works with those two even when the Connection tab shows
+`LicenseAssignment.ReadWrite.All` as missing.
 
 Two limits come from Entra itself, not from this app. An app with
 `User.ReadWrite.All` cannot reset the password of, or delete, a user who
@@ -96,7 +104,7 @@ rotated in Entra, sign in once with the new value and the file is updated.
 
 ## The window
 
-Six tabs run down the left-hand side, the same layout as
+Eight tabs run down the left-hand side, the same layout as
 [watchspend](https://github.com/mediaswing/watchspend). The status bar along
 the bottom shows which tenant you are signed in to, what the app is doing,
 and the result of the last action. Every Graph and MariaDB call runs in the
@@ -151,6 +159,35 @@ Entra half can be enabled, disabled, or deleted from Entra ID.
 If the tenant has no Intune licence, or the app lacks the Intune permission,
 the Entra devices are still shown, with a note saying why the Intune devices
 are missing.
+
+**Licensing** lists the tenant's subscriptions, with how many of each are
+assigned, how many are left, and their status. Products are shown by the
+names the admin centres use where the app knows them, and by Microsoft's
+part number otherwise. Selecting one lists who holds it, and whether
+directly or through a group. **Assign** gives it to a user by sign-in name,
+and **✕** removes a direct assignment after asking first. A licence that
+comes from a group can only be removed by taking the user out of the group.
+Microsoft refuses to assign a licence to a user with no usage location, so
+set one with **Edit** on the Users tab first.
+
+A user's own licences are also listed in their details on the Users tab,
+where **Licences…** ticks and unticks products for them in one go.
+
+**Logs** reads the tenant's **Sign-ins** and its **Audit log**: who signed
+in to what, from where, and whether it worked, and every change made in
+Entra ID and by whom. Choose how far back to look, from the last hour to the
+last 30 days. Optionally, give a sign-in name, to see that user's sign-ins
+or the changes they made, and tick **Failures only**. Then press **Load**.
+Selecting an entry shows everything about it, including the old and new
+values of whatever was changed, and **Export … shown** writes what is
+listed to a CSV file. The **Sign-ins** button in a user's details on the
+Users tab opens their sign-ins here.
+
+A load reads at most the newest 5,000 entries, and says so when there were
+more; a shorter range or a single user brings in the rest. Entra keeps both
+logs for 7 days, or 30 with Entra ID P1 or P2. Reading sign-ins through
+Microsoft Graph needs one of those licences in the tenant; the audit log
+does not.
 
 **Export** copies the directory into a MariaDB or MySQL server; see below.
 
