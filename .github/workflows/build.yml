@@ -1,0 +1,168 @@
+# Test on all three platforms, then package each one with gcm-package, whose
+# platform-specific code is in src/package/. The workflow only calls cargo,
+# so a package built here and one built by hand on a Mac, an Ubuntu box or a
+# Windows PC come out the same.
+#
+# A push of a tag such as v1.0.0 also publishes the packages as a GitHub
+# release.
+
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# Nothing below needs more than to read the repository, except the release
+# job, which asks for its own write access.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # The window-system headers winit needs on Linux, and dpkg-dev for the .deb.
+  LINUX_PACKAGES: >-
+    build-essential pkg-config perl make dpkg-dev
+    libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev
+    libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y --no-install-recommends ${{ env.LINUX_PACKAGES }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  package:
+    name: Package (${{ matrix.name }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS .app
+            os: macos-latest
+            args: --universal
+            targets: aarch64-apple-darwin, x86_64-apple-darwin
+            artifact: gcm-macos
+            files: dist/*.zip
+            # The signed executable from inside the .app, copied out by
+            # gcm-package under a name that says it is the macOS one.
+            scan: target/gcm-macos
+          # The oldest LTS the runners offer, so the .deb's glibc requirement
+          # is one every current Ubuntu release meets.
+          - name: Ubuntu .deb
+            os: ubuntu-22.04
+            args: ""
+            targets: ""
+            artifact: gcm-ubuntu
+            files: dist/*.deb
+            scan: dist/*.deb
+          - name: Windows .zip
+            os: windows-latest
+            args: ""
+            targets: ""
+            artifact: gcm-windows
+            files: dist/*.zip
+            scan: target/release/gcm.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y --no-install-recommends ${{ env.LINUX_PACKAGES }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --release --locked --bin gcm-package -- ${{ matrix.args }}
+      # Submit what was just built to VirusTotal: the executable inside the
+      # .app, the .deb, and gcm.exe. Skipped for pull requests, so the free
+      # API's daily quota goes on builds that matter, and for release tags,
+      # whose files the release job submits instead so that the reports can
+      # go on the release page. The links to each analysis are in this
+      # step's log.
+      - name: Submit to VirusTotal
+        if: github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/v')
+        uses: crazy-max/ghaction-virustotal@v4
+        with:
+          vt_api_key: ${{ secrets.VT_API_KEY }}
+          files: ${{ matrix.scan }}
+          # The free API allows 4 requests a minute, shared by all three jobs.
+          request_rate: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.files }}
+          if-no-files-found: error
+      # The same files, handed to the release job for VirusTotal. Not
+      # published: the release itself carries the archives they came in.
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-${{ matrix.artifact }}
+          path: ${{ matrix.scan }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish the release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download the packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gcm-*
+          path: dist
+          merge-multiple: true
+      - name: Download the files to scan
+        uses: actions/download-artifact@v4
+        with:
+          pattern: scan-gcm-*
+          path: scan
+          merge-multiple: true
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+      # Once the release exists, submit its files to VirusTotal and append a
+      # link to each report to the release notes.
+      - name: Submit to VirusTotal and link the reports
+        uses: crazy-max/ghaction-virustotal@v4
+        with:
+          vt_api_key: ${{ secrets.VT_API_KEY }}
+          github_token: ${{ github.token }}
+          update_release_body: true
+          files: scan/*
+          request_rate: 4
