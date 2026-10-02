@@ -430,7 +430,7 @@ fn relaunch(_: &Path) -> Result<(), String> {
 /// deleted while it was running.
 pub fn clean_up() {
     #[cfg(windows)]
-    if let Some(exe) = std::env::current_exe().ok() {
+    if let Ok(exe) = std::env::current_exe() {
         let old = old_exe(&exe);
         if old.exists() {
             match std::fs::remove_file(&old) {
