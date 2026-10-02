@@ -75,6 +75,8 @@ fn package(_args: &[String]) -> Result<PathBuf> {
     Err("there is no package for this platform; use `cargo build --release`.".into())
 }
 
+/// For the platforms whose package takes no options; macOS reads its own.
+#[cfg(any(target_os = "linux", windows))]
 fn no_arguments(args: &[String]) -> Result {
     match args {
         [] => Ok(()),
