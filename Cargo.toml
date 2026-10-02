@@ -1,6 +1,6 @@
 [package]
 name = "gcm"
-version = "1.0.0"
+version = "1.2.0"
 edition = "2024"
 description = "Graphical Cloud Manager: users, groups and devices in Microsoft Entra ID and Intune, with CSV import and export and a copy to MariaDB"
 license = "MIT"

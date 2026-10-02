@@ -4,7 +4,7 @@
 # Windows PC come out the same.
 #
 # A push of a tag such as v1.0.0 also publishes the packages as a GitHub
-# release.
+# release, with the "## [1.0.0]" section of CHANGELOG.md as its notes.
 
 name: Build
 
@@ -62,10 +62,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Apple silicon only. gcm-package builds for the machine it runs
+          # on, and macos-latest is an Apple silicon runner, so the .app and
+          # its zip (gcm-<version>-macos-aarch64.zip) are arm64. For one that
+          # also runs on Intel Macs, set args to --universal and targets to
+          # "aarch64-apple-darwin, x86_64-apple-darwin".
           - name: macOS .app
             os: macos-latest
-            args: --universal
-            targets: aarch64-apple-darwin, x86_64-apple-darwin
+            args: ""
+            targets: ""
             artifact: gcm-macos
             files: dist/*.zip
             # The signed executable from inside the .app, copied out by
@@ -138,6 +143,31 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Only for CHANGELOG.md, whose section for this version becomes the
+      # release notes.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          sparse-checkout: CHANGELOG.md
+          sparse-checkout-cone-mode: false
+      # The lines under "## [1.1.0]" for the tag v1.1.0, up to the next
+      # "## [" heading. A tag with no section of its own, or an empty one,
+      # stops the release here rather than publishing it without notes.
+      - name: Take the release notes from CHANGELOG.md
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          awk -v heading="## [$version]" '
+            index($0, heading) == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md"; then
+            echo "::error file=CHANGELOG.md::No notes under '## [$version]'. Add that section, then tag again."
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/notes.md"
       - name: Download the packages
         uses: actions/download-artifact@v4
         with:
@@ -150,10 +180,14 @@ jobs:
           pattern: scan-gcm-*
           path: scan
           merge-multiple: true
+      # The changelog's notes first; GitHub's own generated notes (the
+      # pull requests merged, and a link to compare with the last release)
+      # are added after them.
       - name: Create the release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          body_path: ${{ runner.temp }}/notes.md
           generate_release_notes: true
           fail_on_unmatched_files: true
       # Once the release exists, submit its files to VirusTotal and append a

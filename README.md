@@ -266,7 +266,10 @@ code for each platform is in `src/package/`: `macos.rs`, `ubuntu.rs` and
 `windows.rs`. It builds the package for the platform it runs on, and writes
 it to `dist/`. GitHub Actions runs the same command (see
 `.github/workflows/build.yml`), and publishes the packages when a `v*` tag is
-pushed.
+pushed. The release notes are that version's section of `CHANGELOG.md`, so
+before tagging `v1.1.0`, rename `## [Unreleased]` to `## [1.1.0]`. A tag
+with no section of its own fails the release rather than publishing it
+without notes.
 
 #### macOS: an ad-hoc signed `.app`
 
@@ -281,6 +284,10 @@ silicon. It is not notarised, so the first time a downloaded copy is opened,
 macOS will refuse. To allow it, go to **System Settings → Privacy &
 Security**, scroll down, and press **Open Anyway**. To give the app an icon,
 put an `AppIcon.icns` in `packaging/macos/` before building.
+
+The macOS package published with each release is built for Apple silicon
+only, as `gcm-<version>-macos-aarch64.zip`. It will not run on an Intel Mac;
+build one there with the first command above, or anywhere with `--universal`.
 
 #### Ubuntu: a `.deb`
 
