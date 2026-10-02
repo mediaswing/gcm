@@ -190,13 +190,33 @@ jobs:
           body_path: ${{ runner.temp }}/notes.md
           generate_release_notes: true
           fail_on_unmatched_files: true
-      # Once the release exists, submit its files to VirusTotal and append a
-      # link to each report to the release notes.
-      - name: Submit to VirusTotal and link the reports
+      # Once the release exists, submit its files to VirusTotal.
+      - name: Submit to VirusTotal
+        id: virustotal
         uses: crazy-max/ghaction-virustotal@v4
         with:
           vt_api_key: ${{ secrets.VT_API_KEY }}
-          github_token: ${{ github.token }}
-          update_release_body: true
           files: scan/*
           request_rate: 4
+      # Then add a link to each report to the release notes. The action's
+      # own update_release_body only works for a run started by a release
+      # event, and this one is started by a tag, so it is done here from the
+      # action's output: "file=url,file=url,…".
+      - name: Link the VirusTotal reports from the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          ANALYSIS: ${{ steps.virustotal.outputs.analysis }}
+        run: |
+          {
+            gh release view "$TAG" --repo "$REPO" --json body --jq .body
+            printf '\n### VirusTotal\n\n'
+            IFS=',' read -ra entries <<< "$ANALYSIS"
+            for entry in "${entries[@]}"; do
+              # Split at the first "=": the report URLs end in base64 "==".
+              echo "- [$(basename "${entry%%=*}")](${entry#*=})"
+            done
+          } > "$RUNNER_TEMP/body.md"
+          cat "$RUNNER_TEMP/body.md"
+          gh release edit "$TAG" --repo "$REPO" --notes-file "$RUNNER_TEMP/body.md"
