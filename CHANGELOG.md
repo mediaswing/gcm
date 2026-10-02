@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.2.0]
 
 - A Licensing tab: every subscription with its assigned, available and
   total counts, who holds each one (directly or through a group), assigning
