@@ -25,17 +25,23 @@ impl<T: Send + 'static> Task<T> {
     ) -> Self {
         let (tx, rx) = channel();
         let ctx = ctx.clone();
+        let label = label.into();
+        let name = label.clone();
+        log::debug!("task started: {name}");
         std::thread::spawn(move || {
+            let started = std::time::Instant::now();
             let result = work();
+            let millis = started.elapsed().as_millis();
+            match &result {
+                Ok(_) => log::debug!("task finished: {name} in {millis} ms"),
+                Err(err) => log::debug!("task failed: {name} after {millis} ms: {err}"),
+            }
             // The receiving pane may have been replaced in the meantime, in
             // which case nobody wants the answer any more.
             let _ = tx.send(result);
             ctx.request_repaint();
         });
-        Self {
-            rx,
-            label: label.into(),
-        }
+        Self { rx, label }
     }
 
     /// The answer, once there is one. A thread that panicked counts as an

@@ -183,12 +183,21 @@ pub fn read_import(path: &Path) -> Result<Vec<ImportRow>, String> {
             user.validate()?;
             Ok(user)
         })();
+        if let Err(err) = &user {
+            log::debug!("import line {line} skipped: {err}");
+        }
         rows.push(ImportRow {
             line,
             user,
             generated_password,
         });
     }
+    log::info!(
+        "read {} rows from {}, {} ready to create",
+        rows.len(),
+        path.display(),
+        rows.iter().filter(|r| r.user.is_ok()).count()
+    );
     Ok(rows)
 }
 

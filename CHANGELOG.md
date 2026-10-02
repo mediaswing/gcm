@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+- A debug log, switched on under Settings or with `GCM_DEBUG=1`. It records
+  each Graph request with its status, timing and Microsoft request ID, the
+  steps of a MariaDB export, background jobs and crashes, in `gcm-debug.log`
+  in the data directory. Secrets, tokens and passwords are never written.
+
 ## [1.0.0]
 
 First release.

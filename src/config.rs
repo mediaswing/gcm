@@ -50,12 +50,15 @@ pub struct Config {
     /// The application (client) ID of the app registration.
     pub client_id: String,
     pub mariadb: MariaDbSettings,
+    /// Write a detailed log to `gcm-debug.log`; see [`crate::logging`].
+    pub debug_logging: bool,
 }
 
 impl Config {
     pub fn load() -> Self {
         let path = config_path();
         let Ok(text) = std::fs::read_to_string(&path) else {
+            log::debug!("no settings at {}, starting fresh", path.display());
             return Self::default();
         };
         serde_json::from_str(&text).unwrap_or_else(|err| {
@@ -71,7 +74,9 @@ impl Config {
 
     pub fn save(&self) -> std::io::Result<()> {
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        write_private(&config_path(), json.as_bytes())
+        let path = config_path();
+        log::debug!("saving settings to {}", path.display());
+        write_private(&path, json.as_bytes())
     }
 }
 

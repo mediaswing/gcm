@@ -1,4 +1,4 @@
-//! The Settings pane: light, dark, or follow the system.
+//! The Settings pane: light, dark, or follow the system, and the debug log.
 
 use egui::{RichText, Ui};
 
@@ -7,7 +7,7 @@ use crate::config::Appearance;
 use crate::ui;
 
 pub fn show(app: &mut App, ui: &mut Ui) {
-    ui::pane_header(ui, "Settings", "How the app looks.");
+    ui::pane_header(ui, "Settings", "How the app looks, and a log for when something goes wrong.");
 
     egui::ScrollArea::vertical().show(ui, |ui| {
         ui.set_max_width(640.0);
@@ -30,6 +30,52 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             ui.label(RichText::new(appearance.description()).size(12.0).weak());
             ui.add_space(8.0);
         }
+        ui.add_space(8.0);
+        ui.label(RichText::new("Troubleshooting").strong());
+        ui.add_space(6.0);
+        let forced = crate::logging::forced_by_environment();
+        let mut debug = app.config.debug_logging;
+        if ui
+            .add_enabled(!forced, egui::Checkbox::new(&mut debug, "Write a debug log"))
+            .changed()
+        {
+            match crate::logging::set_debug(debug) {
+                Ok(()) => {
+                    app.config.debug_logging = debug;
+                    changed = true;
+                }
+                Err(err) => app.report_error(err),
+            }
+        }
+        let log_path = crate::logging::path();
+        ui.label(
+            RichText::new(format!(
+                "Records each request to Microsoft Graph and MariaDB, with its result and Microsoft's request ID, in {}. Secrets, tokens and passwords are never written to it.",
+                crate::config::tilde(&log_path)
+            ))
+            .size(12.0)
+            .weak(),
+        );
+        if forced {
+            ui.label(
+                RichText::new("On for this run, because GCM_DEBUG is set.")
+                    .size(12.0)
+                    .color(ui::warn_colour(ui)),
+            );
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui.button("Show the log file").clicked()
+                && let Err(err) = crate::logging::reveal()
+            {
+                app.report_error(err);
+            }
+            if ui.button("Copy its location").clicked() {
+                ui.ctx().copy_text(log_path.display().to_string());
+                app.report_ok("Log file location copied.");
+            }
+        });
+
         if changed && let Err(err) = app.config.save() {
             app.report_error(format!("The setting could not be saved: {err}"));
         }

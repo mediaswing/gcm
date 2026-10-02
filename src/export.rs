@@ -115,7 +115,20 @@ impl MariaDbSettings {
     }
 
     pub fn connect(&self) -> Result<Conn, String> {
-        Conn::new(self.opts()?).map_err(|e| format!("Could not connect to {}: {e}", self.label()))
+        let opts = self.opts()?;
+        log::debug!(
+            "connecting to MariaDB at {} (TLS {}, skip host name check {}, extra CA {})",
+            self.label(),
+            self.use_tls,
+            self.tls_skip_verify,
+            !self.ca_cert_path.trim().is_empty()
+        );
+        let conn = Conn::new(opts).map_err(|e| {
+            log::warn!("MariaDB connection to {} failed: {e}", self.label());
+            format!("Could not connect to {}: {e}", self.label())
+        })?;
+        log::debug!("connected to MariaDB at {}", self.label());
+        Ok(conn)
     }
 
     /// Connect, and make sure the tables can be created. What "Test" does.
@@ -285,6 +298,7 @@ fn write_table(
         columns.join(",")
     );
     let count = rows.len();
+    let started = std::time::Instant::now();
 
     let mut tx = conn
         .start_transaction(TxOpts::default())
@@ -296,6 +310,10 @@ fn write_table(
     tx.exec_batch(&statement, rows.into_iter().map(Params::Positional))
         .map_err(|e| format!("Could not write {table}: {e}"))?;
     tx.commit().map_err(|e| e.to_string())?;
+    log::debug!(
+        "{table}: wrote {count} rows in {} ms (mirror {mirror})",
+        started.elapsed().as_millis()
+    );
     Ok(count)
 }
 
@@ -306,7 +324,9 @@ pub fn run(
     choices: Choices,
     progress: &Arc<Mutex<String>>,
 ) -> Result<String, String> {
+    log::info!("export to {} started: {choices:?}", settings.label());
     let say = |text: &str| {
+        log::debug!("export: {text}");
         if let Ok(mut p) = progress.lock() {
             *p = text.to_owned();
         }

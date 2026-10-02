@@ -152,7 +152,33 @@ are missing.
 
 **Export** copies the directory into a MariaDB or MySQL server; see below.
 
-**Settings** chooses light, dark, or following the system.
+**Settings** chooses light, dark, or following the system, and turns the
+debug log on or off.
+
+## The debug log
+
+When something goes wrong, tick **Write a debug log** under **Settings** and
+try again. The app then writes `gcm-debug.log` in its data directory (see
+[Where things are kept](#where-things-are-kept)); **Show the log file**
+opens it in the file manager. To log a single run from the very start, set
+`GCM_DEBUG=1` instead:
+
+```sh
+GCM_DEBUG=1 gcm
+```
+
+Each request to Microsoft Graph is logged with its method, path, status, how
+long it took and Microsoft's request ID, which Microsoft support will ask for.
+So are each step of a MariaDB export, every background job, and any crash.
+The client secret, access tokens, passwords and request bodies are never
+written to it. Paths and messages can include object IDs, sign-in names and
+group names, so look through the file before sharing it.
+
+The file is readable only by you. Once it passes 5 MB, it is moved to
+`gcm-debug.log.1` the next time logging starts, replacing any older one.
+
+Warnings still go to the terminal as before, and `RUST_LOG` controls that as
+usual.
 
 ## CSV import format
 

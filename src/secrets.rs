@@ -76,6 +76,7 @@ pub fn save(secrets: &Secrets) -> Result<(), String> {
     let shown = crate::config::tilde(&path);
     if secrets.is_empty() {
         if path.exists() {
+            log::debug!("nothing left to remember; removing {}", path.display());
             set_read_only(&path, false).ok();
             std::fs::remove_file(&path)
                 .map_err(|e| format!("Could not remove {shown}: {e}"))?;
@@ -84,6 +85,13 @@ pub fn save(secrets: &Secrets) -> Result<(), String> {
     }
 
     let json = serde_json::to_string_pretty(secrets).map_err(|e| e.to_string())?;
+    // Which secrets, never what they are.
+    log::debug!(
+        "saving {} (client secret {}, MariaDB password {})",
+        path.display(),
+        !secrets.client_secret.is_empty(),
+        !secrets.mariadb_password.is_empty()
+    );
     // The file is read-only between runs, so it has to be made writable for
     // the moment it is being replaced.
     if path.exists() {

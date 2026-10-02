@@ -64,12 +64,21 @@ pub struct App {
 impl App {
     pub fn new(cc: &CreationContext<'_>) -> Self {
         let config = Config::load();
+        let mut status = None;
+        if config.debug_logging
+            && let Err(err) = crate::logging::set_debug(true)
+        {
+            status = Some(Status {
+                message: err,
+                good: false,
+            });
+        }
         crate::theme::apply(&cc.egui_ctx);
         crate::theme::apply_appearance(&cc.egui_ctx, config.appearance);
 
         let mut app = Self {
             tab: Tab::Connection,
-            status: None,
+            status,
             graph: None,
             session: None,
             connection: ui::connection::State::from_config(&config),
@@ -93,8 +102,10 @@ impl App {
     }
 
     pub fn report_ok(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        log::info!("{message}");
         self.status = Some(Status {
-            message: message.into(),
+            message,
             good: true,
         });
     }
@@ -126,7 +137,8 @@ impl App {
             let button = egui::Button::selectable(selected, ui::centred(tab.title()))
                 .corner_radius(6.0)
                 .min_size(egui::vec2(ui.available_width(), 44.0));
-            if ui.add(button).clicked() {
+            if ui.add(button).clicked() && self.tab != tab {
+                log::debug!("tab: {}", tab.title());
                 self.tab = tab;
             }
             ui.add_space(6.0);

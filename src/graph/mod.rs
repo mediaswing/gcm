@@ -121,6 +121,7 @@ impl Graph {
     pub fn sign_in(&self) -> Result<Session> {
         let bearer = self.bearer()?;
         let roles = roles_in(&bearer);
+        log::info!("signed in; the token carries {} roles: {}", roles.len(), roles.join(", "));
         // Optional: without Organization.Read.All this is a 403, and that is
         // no reason to refuse to connect.
         let organisation = self
@@ -164,6 +165,11 @@ impl Graph {
             return Err("The tenant ID is a GUID or a domain such as contoso.onmicrosoft.com.".to_owned());
         }
         let url = format!("{LOGIN}/{tenant}/oauth2/v2.0/token");
+        log::debug!(
+            "requesting a token for tenant {tenant}, client {}",
+            c.client_id.trim()
+        );
+        let started = Instant::now();
         let mut response = self
             .inner
             .agent
@@ -174,8 +180,17 @@ impl Graph {
                 ("client_secret", c.client_secret.as_str()),
                 ("scope", "https://graph.microsoft.com/.default"),
             ])
-            .map_err(|e| format!("Could not reach Microsoft sign-in: {e}"))?;
+            .map_err(|e| {
+                log::warn!("token request failed to send: {e}");
+                format!("Could not reach Microsoft sign-in: {e}")
+            })?;
         let status = response.status();
+        let request_id = request_id(&response);
+        log::debug!(
+            "token request answered {} in {} ms (request-id {request_id})",
+            status.as_u16(),
+            started.elapsed().as_millis()
+        );
         let body: Value = response
             .body_mut()
             .read_json()
@@ -188,6 +203,10 @@ impl Graph {
                 .or_else(|| body["error"].as_str())
                 .unwrap_or("unknown error");
             let first = description.lines().next().unwrap_or(description);
+            log::warn!(
+                "sign-in refused ({}, request-id {request_id}): {first}",
+                status.as_u16()
+            );
             return Err(format!("Sign-in refused: {first}"));
         }
 
@@ -199,6 +218,7 @@ impl Graph {
         let parsed: TokenResponse = serde_json::from_value(body)
             .map_err(|e| format!("Unexpected answer from Microsoft sign-in: {e}"))?;
         let bearer = parsed.access_token;
+        log::debug!("token received, valid for {} s", parsed.expires_in);
         *slot = Some(Token {
             bearer: bearer.clone(),
             expires: Instant::now() + Duration::from_secs(parsed.expires_in),
@@ -245,8 +265,13 @@ impl Graph {
                 .send_json(body),
             _ => return Err(format!("unsupported request {method} {path}")),
         };
-        let mut response = sent.map_err(|e| format!("Could not reach Microsoft Graph: {e}"))?;
+        let started = Instant::now();
+        let mut response = sent.map_err(|e| {
+            log::warn!("{method} {} failed to send: {e}", shown(path));
+            format!("Could not reach Microsoft Graph: {e}")
+        })?;
         let status = response.status();
+        let request_id = request_id(&response);
         let text = response
             .body_mut()
             .with_config()
@@ -254,9 +279,22 @@ impl Graph {
             .read_to_string()
             .map_err(|e| format!("Unreadable answer from Microsoft Graph: {e}"))?;
 
+        let millis = started.elapsed().as_millis();
         if !status.is_success() {
-            return Err(graph_error(status.as_u16(), &text));
+            let error = graph_error(status.as_u16(), &text);
+            log::warn!(
+                "{method} {} answered {} in {millis} ms (request-id {request_id}): {error}",
+                shown(path),
+                status.as_u16()
+            );
+            return Err(error);
         }
+        log::debug!(
+            "{method} {} answered {} in {millis} ms, {} bytes (request-id {request_id})",
+            shown(path),
+            status.as_u16(),
+            text.len()
+        );
         if text.trim().is_empty() {
             return Ok(None);
         }
@@ -286,6 +324,7 @@ impl Graph {
             }
             next = page["@odata.nextLink"].as_str().map(str::to_owned);
         }
+        log::debug!("{} items from {}", items.len(), shown(path));
         Ok(items)
     }
 
@@ -303,6 +342,28 @@ impl Graph {
 
     pub fn delete(&self, path: &str) -> Result<()> {
         self.send("DELETE", path, None).map(drop)
+    }
+}
+
+/// The ID Microsoft gives each request, which its support asks for. Graph
+/// calls the header `request-id`; the sign-in endpoint, `x-ms-request-id`.
+fn request_id(response: &ureq::http::Response<ureq::Body>) -> String {
+    let headers = response.headers();
+    ["request-id", "x-ms-request-id"]
+        .iter()
+        .find_map(|name| headers.get(*name)?.to_str().ok())
+        .unwrap_or("none")
+        .to_owned()
+}
+
+/// A request's path for the log, without Graph's address in front of a
+/// `@odata.nextLink`, and with the skip token that follows it cut short:
+/// it is long, opaque, and says nothing a reader can use.
+fn shown(path: &str) -> String {
+    let path = path.strip_prefix(GRAPH).unwrap_or(path);
+    match path.find("$skiptoken=") {
+        Some(at) => format!("{}$skiptoken=…", &path[..at]),
+        None => path.to_owned(),
     }
 }
 
@@ -389,6 +450,15 @@ mod tests {
         assert!(Graph::url("https://graph.microsoft.com.evil.example/v1.0/users").is_err());
         assert!(Graph::url("https://evil.example/users").is_err());
         assert!(Graph::url("users").is_err());
+    }
+
+    #[test]
+    fn logged_paths_lose_the_host_and_the_skip_token() {
+        assert_eq!(shown("/users?$top=999"), "/users?$top=999");
+        assert_eq!(
+            shown(&format!("{GRAPH}/users?$top=999&$skiptoken=RFNwdAIAAQAAAD")),
+            "/users?$top=999&$skiptoken=…"
+        );
     }
 
     #[test]

@@ -64,6 +64,11 @@ fn start(app: &mut App, ctx: &egui::Context) {
         client_secret: app.connection.client_secret.clone(),
     });
     app.connection.error = None;
+    log::info!(
+        "signing in to tenant {}, client {}",
+        app.connection.tenant_id.trim(),
+        app.connection.client_id.trim()
+    );
     app.connection.signing_in = Some(Task::spawn(ctx, "Signing in…", move || {
         let session = graph.sign_in()?;
         Ok((graph, session))

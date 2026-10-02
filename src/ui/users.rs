@@ -777,6 +777,9 @@ fn preview_modal(app: &mut App, ctx: &egui::Context) {
                         *p = format!("Creating user {} of {total}…", n + 1);
                     }
                     let outcome = graph.create_user(&user).map(|u| u.id);
+                    if let Err(err) = &outcome {
+                        log::warn!("import line {line} ({}) failed: {err}", user.user_principal_name);
+                    }
                     results.push(ImportResult {
                         line,
                         user_principal_name: user.user_principal_name.clone(),

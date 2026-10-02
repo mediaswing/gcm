@@ -8,6 +8,7 @@ mod config;
 mod csvio;
 mod export;
 mod graph;
+mod logging;
 mod secrets;
 mod task;
 mod theme;
@@ -18,7 +19,7 @@ mod ui;
 pub const APP_NAME: &str = "Graphical Cloud Manager";
 
 fn main() -> eframe::Result {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    logging::init();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
